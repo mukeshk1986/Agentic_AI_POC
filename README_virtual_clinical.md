@@ -1,62 +1,120 @@
-CMS Risk Adjustment
+# CMS Risk Adjustment & GAP Suspecting
 
-CMS Risk Adjustment is a methodology used by the Centers for Medicare & Medicaid Services (CMS) to ensure that
-health plans are fairly compensated for the risk profile of their enrolled members. It adjusts payments based on the
-health status and demographic characteristics of beneficiaries. Why It Matters: Fair Reimbursement: Plans serving
-sicker or more complex patients receive higher payments to reflect the expected cost of care. Encourages Accurate
-Documentation: Providers and plans are incentivized to document all relevant diagnoses to ensure proper risk
-scoring. Supports Value-Based Care: Accurate risk scores help align incentives with patient outcomes and care
-quality. How It Works: Use claims and encounter data to identify diagnoses. Use member demographic data to
-classify the member in right category & model. Diagnoses are then mapped to Hierarchical Condition Categories
-(HCCs), which are weighed to calculate a Risk Adjustment score (aka RAF). The RAF score influences the capitation
-payment CMS makes to Medicare Advantage and ACA plans.CMS Risk Adjustment is a methodology used by the Centers for Medicare & Medicaid
-Services (CMS) to ensure that health plans are fairly compensated for the risk profile of their
-enrolled members. It adjusts payments based on the health status and demographie
-characteristies of beneficiaries.
-Why It Matters:
-. Fair Reimbursement:
-Plans serving sicker or more complex patients receive higher payments to reflect the
-expected cost of care.
-. Encourages Accurate Documentation:
-Providers and plans are Incentivized to document all relevant diagnoses to ensure
-proper risk scoring.
-. Supports Value-Based Care:
-Accurate risk scores help align incentives with patient outcomes and care quality.
-How It Works:
-· Use claims and encounter data to identify diagnoses. Use member demographic data to
-classify the member in right category & model.
-. Diagnoses are then mapped to Hierarchical Condition Categories (HCCs), which are
-welghed to calculate a Risk Adjustment score (aka RAF).
-. The RAF score influences the capitation payment CMS makes to Medicare Advantage
-and ACA plans.
+This document summarizes the purpose and high-level requirements for a CMS Risk
+Adjustment and Diagnosis GAP Suspecting application.
 
-GAP Suspecting
-Diagnosis GAP Suspecting is a process used to identify missing or undocumented chronic
-conditions in a member's medical record that could impact their risk score and care
-management. These gaps often occur when a condition was previously documented but
-not captured in the current reporting period. How It Works: Compares historical
-diagnoses with current-year claims and encounters. Applying Suspecting Methodology
-rules to flag potential missing conditions. Generates suspect lists (CHASE) for provider
-review or outreach teams. Key Benefits of Risk Adjustment & Dx GAP Suspecting: Revenue
-Optimization: Accurate risk scores directly impact plan revenue and capturing all eligible
-diagnoses helps avoid underpayment from CMS Compliance & Audit Readiness: Proper
-documentation reduces audit risk and ensures regulatory compliance. Population Health
-Insights: Helps identify high-risk members for care management and intervention.
-Operational Efficiency: Prioritized GAP suspect lists streamline chart reviews and provider
-engagement.
-Diagnosis GAP Suspecting is a process used to identify missing or undocumented chronic
-conditions in a member's medical record that could impact their risk score and care
-management. These gaps often occur when a condition was prevlously documented but not
-captured in the current reporting period.
-How It Works:
-. Compares historical diagnoses with current-year claims and encounters.
-. Applying Suspecting Methodology rules to flag potential missing conditions.
-. Generates suspect lists (CHASE) for provider revlew or outreach teams.
-Key Benefits of Risk Adjustment & Dx GAP Suspecting:
-. Revenue Optimization:
-Accurate risk scores directly impact plan revenue and capturing all eligible diagnoses
-helps avold underpayment from CMS
-. Compliance & Audit Readiness:
-Proper documentation reduces audit risk and ensures regulatory compliance.
-. Population Health Insights:
-Helps identify high-risk members for care management and intervention.
+## Purpose
+
+- Explain CMS Risk Adjustment (RAF) calculations and data inputs.
+- Describe Diagnosis GAP Suspecting to identify missing or undocumented chronic
+	conditions that could impact risk scores and revenue.
+
+## 1. CMS Risk Adjustment (RAF) — Overview
+
+CMS Risk Adjustment ensures health plans are fairly compensated for the risk
+profile of their enrolled members. It adjusts payments based on member health
+status and demographics, and it drives capitation payments for Medicare
+Advantage and ACA plans.
+
+### Why it matters
+
+- Fair reimbursement for plans serving higher-risk members
+- Encourages accurate clinical documentation and coding
+- Supports value-based care by aligning payments with expected costs
+
+### How it works (high level)
+
+1. Ingest claims and encounter data
+2. Extract diagnosis codes from clinical records
+3. Map diagnoses to Hierarchical Condition Categories (HCCs)
+4. Apply HCC weights and model variables to compute a RAF score
+5. Output RAF per member for capitation/payment calculations
+
+### Data inputs
+
+- Claims/encounter records (diagnosis codes, procedure codes, dates)
+- Member demographics (DOB, gender, plan type)
+- Enrollment records
+- Reference tables (ICD→HCC mapping, HCC weights, exclusion rules)
+
+### Data outputs
+
+- RAF score per member
+- HCC mappings per diagnosis code
+- RAF calculation breakdown (variables and weights)
+
+## 2. GAP Suspecting — Overview
+
+Diagnosis GAP Suspecting finds conditions that were documented in prior years
+but are missing from the current reporting period. The goal is to surface gaps
+that, if confirmed, would increase RAF scores and recover revenue.
+
+### Key processes
+
+- Compare historical diagnoses with current-year claims and encounters
+- Apply configurable suspecting rules to flag likely missing conditions
+- Generate prioritized CHASE suspect lists for provider/chart review
+- Integrate with provider outreach and chart retrieval workflows
+
+### Data inputs
+
+- Current-year claims and encounters
+- Prior-year diagnoses and claims
+- Enrollment history (to check continuity)
+- Provider and member contact information
+
+### Data outputs
+
+- Prioritized GAP suspect lists (CHASE) for outreach
+- Gap details and clinical rationale
+- Outreach/review assignments and status tracking
+
+## 3. Core Functional Requirements (Summary)
+
+### CMS Risk Adjustment Module
+
+- Ingest and normalize claims data from professional, facility and pharmacy
+	sources
+- Extract diagnosis codes and deduplicate per member
+- Map ICD codes to HCCs using method metadata and ref tables
+- Apply age/gender/exclusion rules and hierarchy logic
+- Select appropriate risk model and variables
+- Calculate RAF as the sum of weighted variables and demographic factors
+- Persist RAF, HCC details, and calculation breakdown for audit
+
+### GAP Suspecting Module
+
+- Identify members with continuous enrollment across comparison periods
+- Map prior-year diagnoses to HCCs and compare against current-year HCCs
+- Create gap candidates for HCCs present historically but missing currently
+- Score/prioritize gaps using impact, recency, age-appropriateness,
+	and comorbidity signals
+- Assign provider(s) and generate CHASE records for chart review/outreach
+- Track outreach status and measure capture/closure rates
+
+## 4. Business Value & Use Cases
+
+- Revenue optimization — capture all eligible diagnoses to avoid underpayment
+- Compliance and audit readiness — preserve transparent RAF calculations
+- Population health — identify high-risk members for care management
+- Operational efficiency — prioritize chart reviews and provider outreach
+
+## 5. Next steps / Implementation suggestions
+
+- Build ingestion pipelines to load stage tables (pipe-delimited sources)
+- Implement HCC mapping and rule engine (SQL/Spark with reference tables)
+- Implement RAF calculation engine (variable selection, interactions, sums)
+- Implement GAP detection and prioritization pipeline (CHASE outputs)
+- Provide dashboards & APIs for outreach teams and reporting
+
+---
+
+If you'd like, I can now:
+
+1. Generate database table schemas or ETL SQL (Spark/Databricks) for staging
+	 and transform layers.
+2. Implement a reference HCC mapping and a small RAF calculation prototype
+	 (Python/PySpark).
+3. Build the GAP suspect scoring function and sample CHASE export.
+
+Tell me which step you want to tackle first and I will implement it.

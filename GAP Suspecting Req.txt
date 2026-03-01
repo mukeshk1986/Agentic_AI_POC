@@ -1,0 +1,94 @@
+Suspected GAPs Creation for Claims (Methods – 1,2, &10)
+Overview
+Analyze medical and pharmacy claims to find missing Hierarchical Condition Categories (HCCs) that could be documented based on specific clinical indicators defined in GAP methods.
+METHOD_IDMETHOD1On RX, no relevant CC2NOS/NEC, no relevant CC4Prior Year CC10High Risk Proc/Dx, no relevant CC
+Key Steps
+1. Method Metadata & Method Metadata code groups.
+* Load method metadata (Methods 1, 2, and 10 for CMS MA) in to reference table
+* Filters for inclusion-only rules (where EXCLUSION_TYPE_1 and EXCLUSION_TYPE_2 are "NA")
+* These methods define clinical indicators (diagnosis codes, CPT/HCPCS codes, NDCs) that suggest specific HCCs
+2. Claims Data Preparation
+* Professional Claims: Outpatient/physician claims with diagnoses
+* Facility Claims: Hospital/institutional claims with diagnoses
+* Pharmacy Claims: Prescription drug claims (NDC codes)
+* Pseudo Claims: All MAO-004 based claims with Diagnoses
+* Combines all claim types and joins with qualification status where applicable.
+3. Draft Gap Identification
+Method 1 (Pharmacy Drug based gaps):
+* Joins method metadata with pharmacy claims on NDC codes
+* Identifies HCCs suggested by specific medications
+Methods 2 (NOS/NEC Diagnoses based gaps):
+* Joins method metadata with medical claims on:
+o Diagnosis codes (ICD) OR
+* Identifies HCCs suggested by procedures/diagnoses
+Methods 10 (High Risk Procedures based gaps):
+* Joins method metadata with medical claims on:
+o CPT/HCPCS procedure codes OR
+o ICD procedure codes
+* Identifies HCCs suggested by procedures/diagnoses
+* Exclusion Logic 
+Scenario 1 (Multi-step with modifiers):
+1. S1: Find claims with specific CPT/HCPCS codes
+2. S2: Verify modifier codes exist in the same claim
+3. S3: Check if exclusion diagnoses exist in last 180 days
+4. Create GAPs: S2 - S3 (claims without exclusions)
+Scenario 2 (Direct exclusion check):
+1. S1: Find claims with specific CPT/HCPCS codes (no modifier present)
+2. S2: Check if exclusion diagnoses exist in last 180 days
+3. Create GAPs: S1 - S2 (claims without exclusions)
+4. Hierarchy Suppresion on Draft GAPs 
+* Suppress lower severity Draft GAPs based on Hierarchy rules. (ref_hierarchy_config)
+* Add Y or N based on results of the above rule in Suppression1_YN column.
+5. Gap Validation Against Risk Scores
+* Identify existing member HCC assignments from risk_member_output or risk_member_hcc
+* Compares all draft gaps(Suppression1_YN column=’N’ OR ‘Y’) against existing member HCCs( list of HCC code from risk_member_output).
+* Mark gaps as "Y" (already documented) or "N" (true gap) based on match up.
+* All draft GAPs with "N" (true gap) will be qualifying to create GAPs at this stage.
+6. Hierarchy Suppresion on Final GAPs 
+* Apply Hierarchy suppression on all the draft gap (MATCHING_YN column=’N’) with again at this stage (Suppress lower severity Draft GAPs based on Hierarchy rules. (ref_hierarchy_config) and write all unsuppressed final GAPs to ‘Suspected GAPs’ table with ‘Open Suspect’ status. 
+7. Member GAPs Summary View
+* Provides Final GAPs summary view by member, method, Risk Year, Dx Source and condition category and count of Suspected HCC (based on distinct Claims) – Add all columns that are needed for this Table/View.
+* Add Confidence Factor - Based on frequency in the Risk Year, find the confidence factor from ref_method_frequency table.
+o Frequency =no. of times that HCC or DIAG codes appeared during the Risk Year on different claims (distinct Claim BIDs).
+o Confidence factor = PERCENT_WEIGHT from ref_method_frequency table based on Frequency.
+o Note: Confidence factor is currently available for Method 10 only, for method 1 & 2, populate PERCENT_WEIGHT from ref_method_metadata table AS-IS in this column.
+Suspected GAPs Creation for Claims (Method 4)
+Method 4: Prior Year Chronic Condition Methodology
+This methodology identifies members who had a diagnosis for a chronic or persistent condition in previous 2 years but do not have a claim for that condition in the current year. Since chronic conditions should be documented every year, missing diagnoses may indicate a documentation gap or missed coding opportunity. 
+Logic:
+- Collect all diagnoses for each member over the current and previous two years.
+- Focus on chronic/persistent conditions that should be coded every year – See BCBSA document (Medicare_Advantage_Methodologies_Association_NOV2025_working_RAKESH.docx
+- Use reference Table (ref_chronic_condition) for Chronic CC list
+- Flag members who had chronic condition in prior 2 years but not in the current year.
+- Create opportunities for these missing CCs for that member and assign a confidence level based on frequency and recency of prior diagnoses based on ‘ref_method_prior_year’ reference table.
+Example:  
+- Member A had diabetes diagnoses in 2022 and 2023, but not in 2024. Member A is flagged as an opportunity to create a GAP.
+Prior Year Claims Processing
+Persistent = Based on prior years (last 2 years). 
+* To call an HCC an actual persistent in 2025 RISK Year (current Year) for a member, it should be a chronic HCC and that chronic HCC (or a lower severity HCC) should have been identified for the same member in Risk Year 2023 or 2024 (previous 2 years) and should also be identified in Risk Year 2025 OR if a chronic HCC appears first time in 2025 (higher Severity HCC) with Suspect status as 'Confirmed Non Suspect'. 
+* To call an HCC an Open persistent in 2025 RISK Year(current Year) for a member, it should be a chronic HCC and that chronic HCC (or a lower severity HCC) should have been identified for the same member in Risk Year 2023 or 2024 (previous 2 years), but and should NOT be identified in Risk Year 2025. If a chronic HCC appears first time in 2025 (lower Severity HCC) then 'Open NS Persistent' if it is lower severity HCC with Suspect status as 'Open Non Suspect'
+Example: Member HCC Table (acting as Input)
+CYCLE_RUNMEMBER_BIDHOME_PLAN_ID_CDRISK_YEARRISK_MODEL_TYPERISK_MODEL_VERSIONSAS_MODEL_VERSION_IDMEMBER_MODEL_SEGMENTRISK_TYPE_IDRISK_TYPE_DETAIL_IDRISK_TYPE_DETAIL_DESCCHRONIC_HCCDX_SOURCECLAIM_TYPECLAIM_BIDCLAIM_DATEDIAG_CODECOEFF_SCOREHRAHOME_HRACYCLE_RUNACTIVE_IND2024_0411011232024HCCV24V2425.86.P1CNAHCCHCC_058 YClaimFacility - IP2200014/1/2024F290.393  2024_04N2024_1011011232024HCCV24V2425.86.P1CNAHCCHCC_058 YClaimFacility - IP22000210/1/2024F290.393  2024_10N2025_0211011232025HCCV24V2425.86.P1CNAHCCHCC_059 YClaimFacility - IP2200112/1/2025F220.393  2025_02N2025_0411011232025HCCV24V2425.86.P1CNAHCCHCC_058 YClaimFacility - IP2200124/1/2025F290.393  2025_04N2025_0511011232025HCCV24V2425.86.P1CNAHCCHCC_057 YClaimFacility - IP2200135/1/2025F2000.393  2025_05Y 
+Example: Member Persistent Table for above input. Monthly runs from Jan 2025 to Jan 2026:  (Member_Persistent_CC)
+ 
+CYCLE_RUNMEMBER_BIDHOME_PLAN_ID_CDRISK_YEARRISK_MODEL_TYPERISK_MODEL_VERSIONSAS_MODEL_VERSION_IDCC_CODECC_DESCRIPTIONCHRONIC_HCCDX_SOURCECLAIM_TYPECLAIM_BIDCLAIM_DATEDIAG_CODEPERSISTENT_STATUSPERSISTENT_STATUS_REASONSUSPECT_STATUSCOEFF_SCOREDURATIONFREQUNCYCONFIDENCE_FACTOR2025_0111011232025HCCV24V2425.86.P1HCC_058 YClaimFacility - IP2200014/1/2024F29Open Persistent Open Suspect0.39327520.752025_0211011232025HCCV24V2425.86.P1HCC_059 YClaimFacility - IP2200112/1/2025F22Open NS Persistent Open Non Suspect0.393   2025_0211011232025HCCV24V2425.86.P1HCC_058 YClaimFacility - IP2200014/1/2024F29Open Persistent Open Suspect0.39330620.752025_0311011232025HCCV24V2425.86.P1HCC_058 YClaimFacility - IP2200014/1/2024F29Open Persistent Open Suspect0.39333420.752025_0411011232025HCCV24V2425.86.P1HCC_058 YClaimFacility - IP2200124/1/2025F29Actual Persistent Closed Suspect0.393   2025_0511011232025HCCV24V2425.86.P1HCC_057 YClaimFacility - IP2200135/1/2025F200Actual PersistentNew HCCConfirmed Non Suspect0.393   2025_0611011232025HCCV24V2425.86.P1HCC_057 YClaimFacility - IP2200135/1/2025F200Actual PersistentNew HCCConfirmed Non Suspect0.393   2025_0711011232025HCCV24V2425.86.P1HCC_057 YClaimFacility - IP2200135/1/2025F200Actual PersistentNew HCCConfirmed Non Suspect0.393   2025_0811011232025HCCV24V2425.86.P1HCC_057 YClaimFacility - IP2200135/1/2025F200Actual PersistentNew HCCConfirmed Non Suspect0.393   2025_0911011232025HCCV24V2425.86.P1HCC_057 YClaimFacility - IP2200135/1/2025F200Actual PersistentNew HCCConfirmed Non Suspect0.393   2025_1011011232025HCCV24V2425.86.P1HCC_057 YClaimFacility - IP2200135/1/2025F200Actual PersistentNew HCCConfirmed Non Suspect0.393   2025_1111011232025HCCV24V2425.86.P1HCC_057 YClaimFacility - IP2200135/1/2025F200Actual PersistentNew HCCConfirmed Non Suspect0.393   2025_1211011232025HCCV24V2425.86.P1HCC_057 YClaimFacility - IP2200135/1/2025F200Actual PersistentNew HCCConfirmed Non Suspect0.393   2026_0111011232026HCCV24V2425.86.P1HCC_057 YClaimFacility - IP2200135/1/2025F200Open Persistent Open Suspect0.393    
+*Open Suspect = Create a GAP under method 4 (Prior year CC)
+ 
+Adding Confidence Factor to Persistence based GAPs:
+Based on duration & frequency find the confidence factor from ref_method_prior_year table.
+Duration = Days difference between first claim date the HCC was identified in prior year period and the date monthly cycle was run. 
+Frequency =no. of times that HCC or DIAG codes appeared during the prior year period on different claims (distinct Claim BIDs).
+Confidence factor = PERCENT_WEIGHT from ref_method_prior_year table where Duration is between LAST_DX_OCCURANCE_MIN & LAST_DX_OCCURANCE_MAX and Frequency is between DX_FREQUENCY_MIN & DX_FREQUENCY_MAX
+ 
+*Currently in On-prem for ref_method_prior_year table, LAST_DX_OCCURANCE is not captured as MIN or MAX but just as one column, for cloud we will enhance to capture MIN & MAX for better handling.
+Final Suspected GAPs (All Methods)
+Consolidate suspected GAPs data from above methods (1,2,4, &10) in to single view/Table.
+For Open GAP = 
+	Member_BID, Risk Year, Method_ID, SAS_Model_Year, SAS_Model_Version, qualified_claim, CC_Code (HCC) where create GAP status is ‘Create GAP’
+Business Purpose
+This analysis helps healthcare organizations:
+* Identify coding opportunities: Find conditions that are clinically indicated but not documented
+* Improve risk adjustment: Ensure accurate HCC capture for Medicare Advantage plans
+* Support clinical documentation: Flag cases where additional diagnosis coding may be warranted
+* Optimize revenue: Proper HCC documentation impacts risk-adjusted payments
+

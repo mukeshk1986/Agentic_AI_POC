@@ -1,0 +1,624 @@
+Population Advyzer — Risk Engine
+Technical Documentation
+Version: 1.0
+Platform: Databricks on AWS | Apache Airflow (MWAA)
+Last Updated: 2025
+
+Table of Contents
+1. Solution Design Summary
+2. Data Architecture and Data Models
+3. Environment Configuration
+4. Database Schema Overview
+5. Data Ingestion Layer
+6. Data Transformation Layer
+7. Data Curation Layer
+8. CMS HCC Risk Score Calculation
+9. CMS RxHCC Risk Score Calculation
+10. CMS ESRD Risk Score Calculation
+11. HCC Persistence Tracking
+12. Reference Data
+13. Airflow DAG Orchestration
+14. Databricks Workflow (Asset Bundle)
+15. Data Quality Framework
+16. Utility and Helper Framework
+17. CI/CD and Deployment
+18. Configuration Reference
+
+1. Solution Design Summary
+1.1 Business Purpose
+The Risk Engine computes CMS Medicare Advantage (MA) Risk Adjustment scores for health plan members. It ingests raw claims, enrollment, and supplemental data from health plans, transforms and standardizes it, then applies three CMS actuarial models:
+* CMS HCC (Hierarchical Condition Category) — community and institutional risk scores
+* CMS RxHCC — Prescription Drug Plan risk scores
+* CMS ESRD — End-Stage Renal Disease risk scores
+The output risk scores drive actuarial calculations worth $8–12 billion in annual Risk Adjustment revenue for MA health plans.
+1.2 High-Level Architecture
+???????????????????????????????????????????????????????????????????????????????
+?                         POPULATION ADVYZER - RISK ENGINE                    ?
+???????????????????????????????????????????????????????????????????????????????
+?                                                                             ?
+?  ???????????????    ????????????????    ???????????????    ??????????????  ?
+?  ?  SOURCE DATA ?    ?  INGESTION   ?    ?TRANSFORMATION?    ?  CURATION  ?  ?
+?  ?             ?    ?    LAYER     ?    ?    LAYER    ?    ?   LAYER    ?  ?
+?  ? - Claims    ?????? stage_member ??????risk_member  ??????risk_member ?  ?
+?  ? - Enrollment?    ? stage_claims ?    ?risk_member  ?    ?risk_member ?  ?
+?  ? - MMR/MAO   ?    ? stage_pharma ?    ?  _diag      ?    ?  _diag     ?  ?
+?  ? - MOR files ?    ? (18 tables)  ?    ?+ qualify    ?    ?(curated)   ?  ?
+?  ???????????????    ????????????????    ???????????????    ???????????????  ?
+?                                                                      ?      ?
+?                                               ????????????????????????      ?
+?                                               ?                             ?
+?  ?????????????????????????????????????????????????????????????????????????? ?
+?  ?                        CMS SCORING MODELS                              ? ?
+?  ?                                                                        ? ?
+?  ?  ????????????????   ????????????????   ???????????????????????????   ? ?
+?  ?  ?  CMS HCC     ?   ?  CMS RxHCC   ?   ?      CMS ESRD           ?   ? ?
+?  ?  ?  V24 / V28   ?   ?  V05 / V08   ?   ?  Dialysis / Transplant  ?   ? ?
+?  ?  ?  13-step     ?   ?  10-step     ?   ?  Special ESRD models    ?   ? ?
+?  ?  ?  pipeline    ?   ?  pipeline    ?   ?                         ?   ? ?
+?  ?  ????????????????   ????????????????   ???????????????????????????   ? ?
+?  ?         ???????????????????????????????????????????                   ? ?
+?  ?                            ?                                           ? ?
+?  ?                  risk_score / risk_member_hcc                          ? ?
+?  ?                  risk_member_hcc_summary                               ? ?
+?  ?????????????????????????????????????????????????????????????????????????? ?
+?                                                                             ?
+?  ?????????????????????????????????????????????????????????????????????????? ?
+?  ?                    HCC PERSISTENCE ENGINE                              ? ?
+?  ?  risk_member_hcc (current) ? member_persistence_hcc (historical)      ? ?
+?  ?  3-year lookback | BID deduplication | Hierarchy rules                 ? ?
+?  ?????????????????????????????????????????????????????????????????????????? ?
+???????????????????????????????????????????????????????????????????????????????
+
+ORCHESTRATION: Apache Airflow (MWAA) ? 8 DAGs
+COMPUTE:       Databricks on AWS (POP-ADVYZER-LARGE, POP-ADVYZER-STANDARD clusters)
+STORAGE:       Delta Lake (Iceberg-compatible) on S3
+1.3 Data Flow Summary
+S3 Bronze (inbox)
+     ?
+     ?  [data_loader_main]
+stage_* tables (Ingestion Schema)
+     ?
+     ?  [ingestion_to_transformation + qualifying_claims + pseudo_claims + mor_to_health_events]
+risk_member + risk_member_diag (Transformation Schema)
+     ?
+     ?  [ma_model_input_data]
+risk_member + risk_member_diag (Curation Schema — deduplicated, BID-keyed)
+     ?
+     ???? [cms_hcc_risk_score_calc]    ? risk_score, risk_member_hcc, risk_member_hcc_summary
+     ???? [cms_rxhcc_risk_score_calc]  ? risk_score (RxHCC rows)
+     ???? [cms_hcc_esrd_risk_score_calc] ? risk_score (ESRD rows)
+                    ?
+                    ?  [cms_persistence_hcc]
+           member_persistence_hcc (3-year rolling history)
+1.4 Key Design Principles
+PrincipleImplementationMulti-tenant isolationEach health plan has its own schema set ({plan}_ingestion, {plan}_transformation, {plan}_curation)Idempotent processingAll writes use MERGE (upsert) or overwrite with source_load_month partitionCMS model versioningModel version is a runtime parameter (V24/V28 for HCC; V05/V08 for RxHCC)Schema evolutionDelta Lake column mapping mode ('delta.columnMapping.mode' = 'name') enabled on all tablesIceberg compatibilityAll Delta tables have 'delta.enableIcebergCompatV2' = 'true'BID deduplicationSurrogate key BID (prefix + MD5 hash) eliminates duplicate members across sub-plansAuto-optimizationAll large tables have delta.autoOptimize.optimizeWrite = 'true' and delta.autoOptimize.autoCompact = 'true'
+2. Data Architecture and Data Models
+2.1 Catalog and Schema Structure
+pop_{env}                   ? Databricks catalog (pop_dev / pop_qa / pop_stg / pop_prod)
+??? ma_reference            ? Shared reference/config tables (all plans)
+??? {plan}_ingestion        ? Raw ingest stage tables (per plan)
+??? {plan}_transformation   ? Standardized data (per plan)
+??? {plan}_curation         ? Curated / ready-for-scoring data (per plan)
+??? {plan}_gap_curation     ? Gap suspecting output (per plan)
+2.2 Data Model Relationships
+ma_reference.icd_hcc_mapping          ??? HCC code assignment
+ma_reference.coefficient_scores        ??? Risk score weights
+ma_reference.hierarchy_config          ??? HCC hierarchy suppression
+ma_reference.interaction_coefficients  ??? Disease interaction adjustments
+ma_reference.adjustment_factors        ??? Normalization factors
+
+{plan}_curation.risk_member           ???
+                                        ???? CMS scoring models ??? risk_score
+{plan}_curation.risk_member_diag      ???                           risk_member_hcc
+                                                                     risk_member_hcc_summary
+
+{plan}_curation.risk_member_hcc       ??? cms_persistence_hcc ??? member_persistence_hcc
+2.3 Core Table: risk_member
+Stores standardized member demographic and enrollment data. One row per member per enrollment record.
+ColumnTypeDescriptionBIDSTRINGSurrogate key: {prefix}_{MD5(member_id + plan_name)}MEMBER_IDSTRINGSource member identifierMEMBER_FIRST_NAMESTRINGMember first nameMEMBER_LAST_NAMESTRINGMember last nameDATE_OF_BIRTHDATEMember date of birthGENDERSTRINGGender code (M/F)COVERAGE_TYPE_CDSTRINGMedicare coverage typeORECSTRINGOriginal reason for entitlement codeMEDICAID_INDSTRINGMedicaid dual-eligible indicatorHOME_PLAN_ID_CDSTRINGHealth plan IDCONTRACT_IDSTRINGCMS contract identifierENROLLMENT_START_DTDATEEnrollment start dateENROLLMENT_END_DTDATEEnrollment end dateSOURCE_LOAD_MONTHSTRINGProcessing month (YYYY_MM)BHI_CREATED_TSTIMESTAMPRecord created timestampBHI_UPDATED_TSTIMESTAMPRecord updated timestamp2.4 Core Table: risk_member_diag
+Stores standardized diagnosis claims data. One row per member per diagnosis code per claim.
+ColumnTypeDescriptionBIDSTRINGForeign key to risk_memberMEMBER_IDSTRINGSource member identifierHOME_PLAN_ID_CDSTRINGHealth plan IDCONTRACT_IDSTRINGCMS contract identifierCLAIM_TYPESTRINGClaim type (facility/professional/supplemental)SERVICE_FROM_DTDATEService from dateSERVICE_TO_DTDATEService to dateDIAG_CDSTRINGICD-10 diagnosis codeICD_TYPESTRINGICD version (9/10)PROVIDER_NPISTRINGRendering provider NPIFACILITY_TYPE_CDSTRINGFacility type codeSOURCE_LOAD_MONTHSTRINGProcessing month (YYYY_MM)IS_PSEUDO_CLAIMSTRINGPseudo-claim flag (Y/N)BHI_CREATED_TSTIMESTAMPRecord created timestamp2.5 Core Table: risk_score
+Final output table holding computed risk adjustment scores. One row per member per model per score component.
+ColumnTypeDescriptionBIDSTRINGMember surrogate keyMEMBER_IDSTRINGSource member identifierHOME_PLAN_ID_CDSTRINGHealth plan IDCONTRACT_IDSTRINGCMS contract identifierMODELSTRINGCMS model (CMS-HCC/RxHCC/ESRD)MODEL_VERSIONSTRINGModel version (V24/V28/V05/V08)RISK_SCOREDECIMALComputed raw risk scoreNORMALIZED_RISK_SCOREDECIMALNormalized risk scoreWEIGHTED_RISK_SCOREDECIMALWeighted risk score (enrollment-weighted)DEMOGRAPHIC_SCOREDECIMALAge/sex componentDISEASE_SCOREDECIMALHCC disease componentINTERACTION_SCOREDECIMALDisease interaction componentPAYMENT_HCC_COUNTINTEGERNumber of payment HCCsSOURCE_LOAD_MONTHSTRINGProcessing month (YYYY_MM)CYCLE_RUNSTRINGCycle run identifierBHI_CREATED_TSTIMESTAMPRecord created timestamp2.6 Core Table: risk_member_hcc
+Stores all HCC codes assigned to each member with associated diagnostic evidence. This is the bridge between the scoring model and gap suspecting.
+ColumnTypeDescriptionBIDSTRINGMember surrogate keyMEMBER_IDSTRINGSource member identifierHOME_PLAN_ID_CDSTRINGHealth plan IDHCC_CODESTRINGAssigned HCC codeHCC_LABELSTRINGHCC descriptionMODELSTRINGCMS modelMODEL_VERSIONSTRINGModel versionDIAG_CDSTRINGSupporting ICD-10 codeSERVICE_FROM_DTDATESupporting claim dateCLAIM_TYPESTRINGSource claim typeIS_PAYMENT_HCCSTRINGPayment HCC flag (Y/N)SCORE_CONTRIBUTIONDECIMALThis HCC's contribution to total risk scoreSOURCE_LOAD_MONTHSTRINGProcessing month (YYYY_MM)CYCLE_RUNSTRINGCycle run identifierMETHOD_IDINTEGERGap method identifier (1/2/4/10)Partition: (CYCLE_RUN, HOME_PLAN_ID_CD, METHOD_ID)
+2.7 Core Table: member_persistence_hcc
+Tracks HCC codes across rolling 3-year history for persistence analysis.
+ColumnTypeDescriptionBIDSTRINGMember surrogate keyMEMBER_IDSTRINGSource member identifierHOME_PLAN_ID_CDSTRINGHealth plan IDHCC_CODESTRINGPersistent HCC codeDIAGNOSIS_YEARSTRINGYear diagnosis was first recordedLATEST_CLAIM_DTDATEMost recent supporting claim dateOLDEST_CLAIM_DTDATEOldest supporting claim dateCLAIM_COUNTINTEGERNumber of supporting claimsIS_PERSISTENTSTRINGPersistence flag (Y/N)STATUSSTRINGOpen / Closed / SuspectCYCLE_RUNSTRINGCycle run identifierRISK_YEARSTRINGRisk assessment yearSOURCE_LOAD_MONTHSTRINGProcessing monthBHI_CREATED_TSTIMESTAMPRecord created timestampBHI_UPDATED_TSTIMESTAMPRecord updated timestamp
+3. Environment Configuration
+3.1 Environments
+EnvironmentCatalogPurposeDEVpop_devDevelopment and testingQApop_qaQuality assuranceSTGpop_stgStaging / pre-productionPRODpop_prodProduction3.2 Key Configuration Parameters (values.yaml)
+ParameterValue (DEV)Descriptioncatalogpop_devDatabricks Unity Catalog nameconfig_schemama_referenceReference data schemaenvdevEnvironment identifiertarget_score_table_modeoverwrite / mergeWrite mode for score tablesnotebook_time_out3600Max notebook execution time (seconds)s3.arnarn:aws:iam::...IAM instance profile for S3 accessemail_alerts.smtp_serverInternal SMTPAlert email SMTP serveremail_alerts.emailsPopA_Non-prod_Support@Bluehealthintelligence.comAlert recipients3.3 Databricks Connection
+* Connection ID (Airflow): databricks_conn_service_account
+* Host: dbc-adc284cf-52b2.cloud.databricks.com
+* Cluster types:
+o POP-ADVYZER-STANDARD — general-purpose tasks (ingestion, transformation, DDL)
+o POP-ADVYZER-LARGE — compute-intensive tasks (scoring, curation)
+3.4 Data Lake Paths
+TierPathUsageBronze (inbox)/Volumes/pop_{env}/volumes/bhi-pop-{env}-datalake-{plan_name}inbox-us-east-1Source files from health plansSilver (ingestion)/Volumes/pop_{env}/{plan_name}ingestion/ingestion/src_filesFiles staged for ingestionArchive/Volumes/pop_{env}/{plan_name}ingestion/ingestion/archiveProcessed files
+4. Database Schema Overview
+4.1 Ingestion Schema: {plan}_ingestion
+Contains raw stage tables loaded directly from source files.
+TableDescriptionPartitionstage_memberMember demographicsSOURCE_LOAD_MONTHstage_member_enrollmentMember enrollment recordsSOURCE_LOAD_MONTHstage_facility_headerFacility claim headersSOURCE_LOAD_MONTHstage_facility_detailFacility claim service linesSOURCE_LOAD_MONTHstage_facility_diagFacility claim diagnosesSOURCE_LOAD_MONTHstage_professionalProfessional claimsSOURCE_LOAD_MONTHstage_professional_diagProfessional claim diagnosesSOURCE_LOAD_MONTHstage_pharmacyPharmacy claimsSOURCE_LOAD_MONTHstage_health_eventsQuality events / lab resultsSOURCE_LOAD_MONTHstage_providerProvider referenceSOURCE_LOAD_MONTH4.2 Transformation Schema: {plan}_transformation
+Standardized and joined data ready for curation.
+TableDescriptionrisk_memberStandardized member + enrollmentrisk_member_diagStandardized diagnosis claims (facility + professional + supplemental)qualifying_facilityQualifying facility claims (filtered by valid diagnoses)qualifying_profotherQualifying professional/other claimsqualifying_supplemental_maoQualifying MAO-004 supplemental diagnoses4.3 Curation Schema: {plan}_curation
+Curated, deduplicated data used as input to scoring models.
+TableDescriptionrisk_memberFinal deduplicated member table with BID keyrisk_member_diagFinal deduplicated diagnosis table with BID keyrisk_scoreCMS risk adjustment scores (all models)risk_member_hccHCC assignments per member per modelrisk_member_hcc_summaryAggregated HCC summary per membermember_persistence_hcc3-year rolling HCC history4.4 Reference Schema: ma_reference
+Shared across all plans. Contains CMS published model coefficients and configuration.
+TableDescriptionicd_hcc_mappingICD-10-CM to HCC code mappingcoefficient_scoresAge/sex and HCC coefficients by model/versionhierarchy_configHCC hierarchy rules (which codes absorb others)interaction_coefficientsDisease interaction adjustment factorsadjustment_factorsNormalization adjustment factorsref_method_metadataGap suspecting method definitionsref_method_metadata_codegroupsICD code groups per gap methodref_chronic_conditionChronic condition definitionsref_home_planHealth plan referenceref_sas_modelSAS model version mappingref_risk_type_detailRisk type detail (Community/Institutional/etc.)ref_method_frequencyMethod frequency settingsref_bid_mappingBID to member_id cross-referencetime_periodsValid time periods for diagnosis lookback
+5. Data Ingestion Layer
+5.1 Source File Types
+The platform accepts 18 file types from health plans:
+File NameDescriptionTypefacility_detailFacility claim service linesClaimsfacility_diagFacility claim diagnosis codesClaimsfacility_headerFacility claim header recordsClaimsmemberMember demographicsEnrollmentmember_enrollee_historyHistorical enrollment recordsEnrollmentmember_enrollmentActive enrollment recordsEnrollmentpharmacyPharmacy claimsClaimsprofessionalProfessional claimsClaimsprofessional_diagProfessional diagnosis codesClaimsquality_eventsHEDIS quality eventsQualitylabLab resultsQualitydesignated_providerDesignated provider assignmentsProviderproviderProvider referenceProviderlocationLocation referenceProviderhealth_eventsAggregated health eventsQualitymmrMedicare Beneficiary Monthly Summary (MMR)Supplementalmao_004MAO-004 supplemental diagnosesSupplementalmorMedicare Outreach ReportSupplementalSupplemental files: mmr, mao_004, mor
+5.2 Ingestion Process (data_loader_main.py)
+The data loader reads files from the source Volume path, applies schema enforcement, and writes to stage tables.
+Step 1: Locate source files
+  ? Path: /Volumes/pop_{env}/volumes/bhi-pop-{env}-datalake-{plan_name}inbox-us-east-1
+  ? File format: CSV (pipe-delimited for most files)
+
+Step 2: Apply schema from file_read_meta.yaml
+  ? Column names and types enforced per file type
+  ? Missing optional columns filled with NULL
+
+Step 3: Add metadata columns
+  ? SOURCE_LOAD_MONTH = {YYYY_MM}
+  ? BHI_CREATED_TS = current_timestamp()
+
+Step 4: Write to stage_* tables
+  ? Write mode: overwrite partition (SOURCE_LOAD_MONTH)
+  ? Delta format with Iceberg compatibility
+
+Step 5: Archive processed files
+  ? Move files to /Volumes/.../archive/{YYYY_MM}/
+5.3 MMR Supplemental Column Renames
+CMS MMR files use CMS-specific column names. The platform renames them at ingestion:
+Source Column (CMS)Target Column (Internal)HICNMEMBER_IDPART_A_ENTL_DTPART_A_ENROLLMENT_DTPART_B_ENTL_DTPART_B_ENROLLMENT_DTSEXGENDERDOBDATE_OF_BIRTHSTATE_CDSTATE_CODEORECORIGINAL_REASON_ENTITLEMENT_CDCRECCURRENT_REASON_ENTITLEMENT_CDESRD_INDESRD_INDICATORMEDICAID_DUAL_INDMEDICAID_IND5.4 Stage Table Design
+All stage tables share these common design properties:
+USING DELTA
+TBLPROPERTIES (
+    'delta.enableIcebergCompatV2' = 'true',
+    'delta.universalFormat.enabledFormats' = 'iceberg',
+    'delta.columnMapping.mode' = 'name',
+    'delta.minReaderVersion' = '2',
+    'delta.minWriterVersion' = '5'
+)
+PARTITIONED BY (SOURCE_LOAD_MONTH)
+
+6. Data Transformation Layer
+6.1 Transformation Overview
+The transformation layer converts raw stage data into standardized risk_member and risk_member_diag tables within the plan's transformation schema. This layer also applies CMS qualifying claim rules.
+Notebooks involved:
+1. ingestion_to_transformation.py — member demographics + enrollment
+2. qualifying_claims.py — CMS qualification rules for claims
+3. qualifying_transformation.py — applies qualifications to transformation output
+4. pseudo_ingest_to_transform.py — processes pseudo-claims (non-standard supplemental data)
+5. mor_to_health_events_load.py — transforms MOR file into health events format
+6.2 Member Transformation (ingestion_to_transformation.py)
+stage_member (ingestion)            ???
+stage_member_enrollment (ingestion) ?????? JOIN on MEMBER_ID
+                                           ?
+                                           ?
+                                    Add GENDER logic:
+                                    M/F based on enrollment data
+                                           ?
+                                           ?
+                                    Add BID = MD5(MEMBER_ID + PLAN_NAME)
+                                           ?
+                                           ?
+                                    risk_member (transformation)
+6.3 Qualifying Claims Rules
+CMS requires claims to meet specific criteria to be used in risk adjustment. The qualifying_claims.py notebook applies these rules:
+Facility Claims Qualification:
+* Must have valid facility type code
+* Must have valid diagnosis code (ICD-10)
+* Service date must fall within the lookback period
+* Claim status must be paid/final
+* Duplicate claim lines removed
+Professional Claims Qualification:
+* Rendering provider must have valid NPI
+* Claim must not be a non-covered service
+* Valid procedure and diagnosis codes required
+MAO-004 Supplemental Qualification:
+* CMS MAO-004 attestation records
+* File type: mao_supplemental_dx
+* Filtered for valid ICD-10 codes only
+6.4 Pseudo-Claims Processing
+Pseudo-claims are synthetic claims created from supplemental MMR data to represent diagnoses not captured in standard claims:
+stage_mmr (ingestion) ??? Extract diagnosis codes
+                         ??? Create synthetic claim records
+                         ??? Flag IS_PSEUDO_CLAIM = 'Y'
+                         ??? Append to risk_member_diag (transformation)
+6.5 MOR to Health Events
+The Medicare Outreach Report (MOR) file contains care management events. mor_to_health_events_load.py transforms it:
+stage_mor (ingestion) ??? Map MOR event types to standard health event codes
+                         ??? Derive SERVICE_FROM_DT, SERVICE_TO_DT
+                         ??? Write to stage_health_events (transformation)
+
+7. Data Curation Layer
+7.1 ma_model_input_data.py — Risk Model Input Preparation
+This Databricks notebook is the final staging step before CMS scoring. It reads from the transformation schema and writes deduplicated, BID-keyed data to the curation schema.
+Parameters:
+ParameterDescriptionenvEnvironment (DEV/QA/STG/PROD)plan_nameHealth plan identifiermonthProcessing month (MM)risk_yearRisk assessment yearProcess:
+Step 1: Load risk_member (transformation)
+  ? Filter by SOURCE_LOAD_MONTH = {risk_year}_{month}
+  ? Apply HOME_PLAN_ID_CD / CONTRACT_ID filter (if configured)
+
+Step 2: Load risk_member_diag (transformation)
+  ? Join with risk_member on MEMBER_ID
+  ? Filter to members present in step 1
+
+Step 3: BID Assignment
+  ? BID = "{plan_prefix}_{MD5(MEMBER_ID || PLAN_NAME)}"
+  ? Ensures consistent surrogate key across processing runs
+
+Step 4: Deduplication
+  ? risk_member: deduplicate on BID + ENROLLMENT_START_DT
+  ? risk_member_diag: deduplicate on BID + DIAG_CD + SERVICE_FROM_DT
+
+Step 5: Load supplemental MMR diagnoses (if incl_supplemental_mmr = 'Y')
+  ? stage_mmr filtered for valid ICD codes
+  ? Appended to risk_member_diag with CLAIM_TYPE = 'SUPPLEMENTAL_MMR'
+
+Step 6: Write to curation schema
+  ? risk_member ? {plan}_curation.risk_member
+  ? risk_member_diag ? {plan}_curation.risk_member_diag
+  ? Write mode: merge on (BID, SOURCE_LOAD_MONTH)
+Output Columns — risk_member (curation): 30 columns including BID, MEMBER_ID, DATE_OF_BIRTH, GENDER, COVERAGE_TYPE_CD, OREC, MEDICAID_IND, HOME_PLAN_ID_CD, CONTRACT_ID, ENROLLMENT_START_DT, ENROLLMENT_END_DT, AGE (computed), AGE_GROUP, and all enrollment segment fields.
+Output Columns — risk_member_diag (curation): MEMBER_ID, BID, HOME_PLAN_ID_CD, CONTRACT_ID, DIAG_CD, ICD_TYPE, SERVICE_FROM_DT, SERVICE_TO_DT, CLAIM_TYPE, PROVIDER_NPI, FACILITY_TYPE_CD, IS_PSEUDO_CLAIM, SOURCE_LOAD_MONTH.
+
+8. CMS HCC Risk Score Calculation
+8.1 Overview
+The CMS HCC risk scoring model assigns a risk score to each Medicare Advantage member based on their demographic information and diagnosed conditions (HCCs). The platform supports two model versions: V24 and V28.
+Entry Point: src/spark/cms/cms_hcc_risk_score_calc.py
+Parameters:
+ParameterDescriptionenvEnvironmentmodelCMS model code (CMS-HCC)versionModel version (V24 or V28)time_periodDiagnosis lookback period namehome_plan_idHealth plan ID filtercontractCMS contract ID filterplan_namePlan schema prefixsource_load_monthProcessing month (MM)source_load_yearProcessing year (YYYY)incl_supplemental_mmrInclude MMR supplemental data (Y/N)incl_pseudo_claimInclude pseudo-claims (Y/N)8.2 13-Step Calculation Pipeline
+The risk scoring follows a precise 13-step pipeline:
+Step 1: load_and_prepare_data
+- Load risk_member from curation schema
+- Load risk_member_diag from curation schema (filtered by time_period start/end dates)
+- Load reference tables: coefficient_scores, hierarchy_config, interaction_coefficients, adjustment_factors, icd_hcc_mapping
+- Apply HOME_PLAN_ID_CD and CONTRACT_ID filters
+- Cache all reference tables for reuse across iterations
+Step 2: enrich_claims_with_member_data
+- JOIN risk_member_diag with risk_member on BID
+- Add member demographic columns to each diagnosis record
+- Filter: only members with active enrollment during service period
+- Compute AGE at start of risk year: FLOOR(MONTHS_BETWEEN(risk_year_start, DOB) / 12)
+Step 3: get_original_disability
+- Map OREC (Original Reason for Entitlement Code) to disability status
+- OREC = '1' (Age) ? community model
+- OREC = '2' (ESRD) ? ESRD model
+- OREC = '3' (Disability) ? disability model
+- OREC = '4' (Disability + ESRD) ? ESRD+disability model
+- Sets community_model flag for downstream coefficient selection
+Step 4: assign_community_model
+- Determine model segment for each member:
+  - CNA: Community Non-Aged (disability)
+  - CFA: Community Fully-Benefit Dual Aged
+  - CNA: Community Non-Aged/Disabled
+  - INS: Institutional (nursing facility)
+  - NE: New Enrollee
+  - SNPNE: Special Needs Plan New Enrollee
+  - PFFS: Private-Fee-For-Service
+- Model segment drives coefficient lookup in subsequent steps
+Step 5: age_sex_sedits (Demographic Score)
+- Assign age/sex coefficients from coefficient_scores table
+- Age group mapping: 0-34, 35-44, 45-54, 55-59, 60-64, 65-69, 70-74, 75-79, 80-84, 85+
+- Special SEDITS (Sex Edits) processing:
+  - SEDITS_DIAG1: D66, D67 (Hemophilia) — male-only condition
+  - SEDITS_DIAG2: COPD/chronic bronchitis — gender adjustment
+  - SEDITS_DIAG3: C50.* (Breast cancer) — female-only
+  - SEDITS_DIAG4: P04.* (Neonatal drug exposure) — pediatric
+- Result: demographic_score per member
+Step 6: map_icd_to_hcc
+- Join risk_member_diag ICD codes against ma_reference.icd_hcc_mapping
+- Filter by model version (V24 or V28)
+- One ICD code may map to multiple HCCs
+- Filter: only valid ICD codes for the current model version
+- Output: member-level list of candidate HCC codes
+Step 7: apply_hcc_hierarchy_rules
+- Apply hierarchy_config to suppress lower-severity HCCs
+- If member has HCC_A and HCC_B where A absorbs B ? remove HCC_B
+- Example: HCC18 (Diabetes with Acute Complications) absorbs HCC19 (Diabetes without Complications)
+- Applies recursively until no further suppressions possible
+- Output: final set of payment HCCs per member
+Step 8: assign_scores
+- Join payment HCCs with coefficient_scores for the member's model segment
+- Each HCC has a coefficient (relative risk weight)
+- Mark each HCC as IS_PAYMENT_HCC = 'Y'
+- Output: HCC-level scores per member
+Step 9: add_interaction_rules_and_calculate_score
+- Check member's HCC set against interaction_coefficients table
+- Disease interactions (V28 examples):
+  - DIABETES_CHF: Diabetes + Congestive Heart Failure ? additional coefficient
+  - CHF_COPD: CHF + COPD ? additional coefficient
+  - CANCER_IMMUNE: Cancer + immune suppression ? additional coefficient
+- Add interaction score terms to member's total
+- Aggregate: disease_score = SUM(hcc_coefficients) + SUM(interaction_coefficients)
+Step 10: calculate_final_scores
+- total_score = demographic_score + disease_score
+- Store at member level in risk_score table
+Step 11: normalization_scores
+- Apply CMS normalization: normalized_score = total_score / normalization_factor
+- Normalization factor from ma_reference.adjustment_factors
+- Separate normalization factors per model segment (community/institutional)
+Step 12: weighted_risk_score
+- Compute enrollment-weighted risk score per member
+- If member enrolled partial year: weighted_score = normalized_score × (enrolled_months / 12)
+- Aggregated at contract level for revenue calculation
+Step 13: risk_member_hcc processing
+- Write detailed HCC-level records to risk_member_hcc table
+- One row per member per HCC per model
+- Include SCORE_CONTRIBUTION, DIAG_CD evidence, SERVICE_FROM_DT
+- Aggregate into risk_member_hcc_summary (member-level HCC list)
+- Write/merge risk_score table (final output)
+8.3 Key Intermediate DataFrames
+DataFrameDescriptionrisk_member_filteredMembers with active enrollment in study periodrisk_member_diag_filteredDiagnoses within time_period lookback windowenriched_claimsDiagnoses joined with member demographicsicd_to_hcc_mappedICD codes translated to HCC codeshcc_after_hierarchyHCC codes after hierarchy suppressionhcc_with_scoresHCC codes with coefficient scores attachedmember_scoresAggregated score per member per modelfinal_scoresNormalized, weighted final scores8.4 Model Version Differences
+FeatureV24V28ICD-HCC mapping tableV24 mappingsV28 mappings (more specific)Number of payment HCCs86 HCCs115 HCCsDisease interactions12 interactions18 interactionsESRD handlingSeparate modelIntegrated ESRD flagNormalization factorsV24 factorsV28 factors
+9. CMS RxHCC Risk Score Calculation
+9.1 Overview
+The RxHCC model calculates Part D (Prescription Drug) risk scores for Medicare Advantage Prescription Drug (MAPD) plans. Entry point: src/spark/cms/cms_rxhcc_risk_score_calc.py.
+Supported versions: V05 and V08.
+9.2 Key Differences from HCC Model
+AspectCMS HCCCMS RxHCCFocusMedical conditionsPrescription drug costsHCC count86–115~200 RxHCCsDiagnosis sourceAll claimsMedical claims + MMRInteraction termsDisease-diseaseDrug-disease interactionsNormalizationCMS medically frailPDP normalization factorsNew Enrollee modelNE model segmentRxHCC NE model9.3 Processing Pipeline
+The RxHCC model follows the same 10-step pipeline (subset of HCC pipeline):
+load_and_prepare_data ? enrich_claims ? get_disability ? assign_model_segment
+? age_sex_coefficients ? icd_to_rxhcc_mapping ? hierarchy_rules
+? assign_scores ? calculate_final_scores ? normalization_scores
+? write risk_score (MODEL='CMS-RxHCC')
+Note: RxHCC does NOT calculate weighted risk score (not enrollment-weighted for Part D).
+
+10. CMS ESRD Risk Score Calculation
+10.1 Overview
+The ESRD model handles members with End-Stage Renal Disease — either on dialysis or post-transplant. Entry point: src/spark/cms/cms_hcc_esrd_risk_score_calc.py.
+10.2 ESRD Model Segments
+ESRD Model SegmentDescriptionESRD_DIALYSISMembers currently on dialysisESRD_FUNCTIONING_GRAFTPost-transplant with functioning graftESRD_TRANSPLANTMembers who received transplant in current yearESRD_NE_DIALYSISNew Enrollee on dialysisESRD_NE_GRAFTNew Enrollee with functioning graft10.3 ESRD-Specific Transformations (cms_hcc_esrd_transformations.py)
+The ESRD model includes special transformations not present in the standard HCC model:
+1. ESRD status determination
+   ? From MMR ESRD_INDICATOR column
+   ? From OREC code '2' (ESRD) or '4' (Disability + ESRD)
+
+2. Dialysis/Transplant flag
+   ? Procedure codes: Z99.2 (dialysis dependent)
+   ? Transplant codes: T86.1* (kidney transplant complications)
+   ? ESRD CPT/HCPCS procedure code lookups
+
+3. Monthly enrollment segmentation
+   ? Member may be dialysis in some months, transplant in others
+   ? Score computed per enrollment segment
+
+4. ESRD HCC payment suppression
+   ? Some HCCs suppressed in ESRD models (already captured in ESRD premium)
+
+11. HCC Persistence Tracking
+11.1 Business Purpose
+HCC persistence tracks whether a member's diagnosed chronic conditions have been re-documented in the current year. Conditions diagnosed in prior years but not re-documented are "suspect" gaps — a primary input to the gap suspecting engine.
+Entry point: src/spark/cms/cms_persistence_hcc.py Logic library: src/spark/cms/member_persistent_hcc.py
+11.2 Persistence Parameters
+ParameterDescriptionenvEnvironmentplan_nameHealth plansource_load_monthProcessing month (MM)risk_yearCurrent risk yearsource_load_yearData extraction yearprior_yearsNumber of lookback years (default: 2)11.3 Persistence Processing Logic
+The persistence engine compares current-year HCC assignments with prior-year history:
+Step 1: get_latest_batch_per_cycle_run
+  ? Find the most recent completed cycle_run for each prior year
+  ? Ensures we compare against the latest available data
+
+Step 2: filter_by_cycle_and_risk_year
+  ? Extract HCC records for specified risk_year and prior_years
+  ? From risk_member_hcc (current year) and member_persistence_hcc (history)
+
+Step 3: build_src_not_in_tgt (New HCCs)
+  ? HCCs in current year NOT in prior year history ? NEW records
+  ? Status: 'Open' (newly diagnosed)
+
+Step 4: build_tgt_not_in_src (Dropped HCCs)
+  ? HCCs in prior year history NOT in current year ? GAP records
+  ? Status: 'Closed' (not re-documented this year)
+  ? These become inputs to gap suspecting
+
+Step 5: transform_open_suspects_to_persistent
+  ? HCCs present in both current and prior year ? PERSISTENT
+  ? Update IS_PERSISTENT = 'Y', update LATEST_CLAIM_DT
+
+Step 6: build_hierarchy_persistent_final
+  ? Re-apply HCC hierarchy rules to persistent set
+  ? Remove HCCs now suppressed by more-specific codes
+
+Step 7: keep_oldest_by_claim_date
+  ? For duplicate HCC records (same BID + HCC): keep oldest claim date
+  ? Preserves longest history for compliance documentation
+
+Step 8: merge_update_target_table
+  ? Upsert into member_persistence_hcc
+  ? MERGE ON (BID, HCC_CODE, RISK_YEAR, CYCLE_RUN)
+  ? Update LATEST_CLAIM_DT, STATUS, IS_PERSISTENT
+  ? Insert new records
+11.4 Persistence Status Values
+StatusDescriptionGap Suspecting UseOpenFirst-time HCC diagnosisNot a gap (new condition)PersistentRe-documented in current yearNot a gap (already captured)ClosedNot re-documented this yearPrimary gap suspect inputSuspectCarried forward from prior yearSecondary gap suspect input11.5 3-Year Lookback Window
+Risk Year 2025:
+  ??? Prior Year 2024: Compare current HCCs against 2024 persistence records
+  ??? Prior Year 2023: Extend lookback to 2-year window
+  ??? Output: member_persistence_hcc updated for 2025 risk year
+
+12. Reference Data
+12.1 Loading Reference Data
+Reference data is loaded via the prerequisites workflow and is shared across all plans:
+# pop_advyzer_prerequisites_wf.yaml
+ddl_script_run ? dml_operation_schema ? load_reference_data_run ? grant_permission
+All reference tables reside in ma_reference schema.
+12.2 ICD-to-HCC Mapping (ma_reference.icd_hcc_mapping)
+Maps ICD-10-CM diagnosis codes to CMS HCC codes. Published annually by CMS.
+ColumnDescriptionICD_CODEICD-10-CM diagnosis codeHCC_CODEAssigned HCC codeMODELCMS model (CMS-HCC/RxHCC/ESRD)MODEL_VERSIONVersion (V24/V28/V05/V08)ICD_VERICD version (10)DESCRIPTIONHCC descriptionPartition: ICD_VER
+12.3 Coefficient Scores (ma_reference.coefficient_scores)
+Risk score coefficients published by CMS for each model/version/segment.
+ColumnDescriptionMODELCMS modelMODEL_VERSIONVersionMODEL_SEGMENTCommunity/Institutional/NE/etc.LABELAge-sex or HCC labelCOEFFICIENTRisk score weight12.4 Hierarchy Configuration (ma_reference.hierarchy_config)
+Defines which HCC codes are absorbed by higher-hierarchy HCCs.
+ColumnDescriptionMODELCMS modelMODEL_VERSIONVersionHCC_CODEHCC code to be suppressedABSORBS_HCCHigher-hierarchy HCC that absorbs it12.5 Method Metadata (ma_reference.ref_method_metadata)
+Defines gap suspecting methods. Used by both the risk engine (for risk_member_hcc method tagging) and the gap suspecting engine.
+ColumnDescriptionMETHOD_IDUnique method identifier (1, 2, 4, 10)METHOD_NAMEMethod name (e.g., "Diagnosis-Based")PROGRAMProgram (MA/HEDIS/etc.)IS_ACTIVEActive flag (Y/N)FREQUENCYSuspecting frequency (monthly/quarterly/annual)Partition: (METHOD_ID, PROGRAM)
+
+13. Airflow DAG Orchestration
+13.1 Master DAG: pop_advyzer_parent_dag.py
+The parent DAG orchestrates all downstream DAGs based on the application trigger parameter.
+DAG ID: main_dag
+Schedule: Triggered on-demand (no cron schedule)
+Trigger parameter: application ? drives branching logic
+Branching Logic:
+main_dag
+??? Branch: application == 'data_ingestion'
+?     ???? pop_advyzer_data_ingestion_dag (data_ingestion)
+?
+??? Branch: application == 'data_transformation'
+?     ???? pop_advyzer_data_transformation_dag (data_transformation)
+?
+??? Branch: application == 'data_curation'
+?     ???? pop_advyzer_data_curation_dag (data_curation)
+?
+??? Branch: application == 'cms_hcc_risk_scoring'
+?     ???? pop_advyzer_cms_hcc_score_dag (cms_hcc_risk_scoring)
+?
+??? Branch: application == 'cms_rxhcc_risk_scoring'
+?     ???? pop_advyzer_cms_rxhcc_score_dag (cms_rxhcc_risk_scoring)
+?
+??? Branch: application == 'cms_hcc_esrd_risk_scoring'
+?     ???? pop_advyzer_cms_hcc_esrd_score_dag (cms_hcc_esrd_risk_scoring)
+?
+??? Branch: application == 'gp_curation'
+?     ???? pop_advyzer_gp_curation_dag (gp_curation)
+?            ??? cms_persistence_hcc
+?            ??? gp_suspecting
+?
+??? Branch: application == 'reference_data_ingestion'
+      ???? pop_advyzer_reference_data_ingestion_dag
+13.2 Data Ingestion DAG (pop_advyzer_data_ingestion_dag.py)
+DAG ID: data_ingestion
+TaskNotebookClusterdata_loader_mainspark/data_loader/data_loader_mainPOP-ADVYZER-STANDARDvalidate_ingestionspark/validate (stage=ingestion)GE clusterTask Flow: data_loader_main ? validate_ingestion
+13.3 Data Transformation DAG (pop_advyzer_data_transformation_dag.py)
+DAG ID: data_transformation
+TaskNotebookClusterdata_transformation_commonspark/data_standardization/ingestion_to_transformationPOP-ADVYZER-STANDARDvalidate_transformationspark/validate (stage=transformation)GE clusterqualifying_claimsspark/data_standardization/qualifying_claimsPOP-ADVYZER-STANDARDpseudo_claimsspark/data_standardization/pseudo_ingest_to_transformPOP-ADVYZER-STANDARDmor_health_eventsspark/data_standardization/mor_to_health_events_loadPOP-ADVYZER-STANDARDTask Flow:
+data_transformation_common ? validate_transformation ? qualifying_claims ? pseudo_claims
+data_transformation_common ??????????????????????????????????????????????????????????? mor_health_events
+13.4 Data Curation DAG (pop_advyzer_data_curation_dag.py)
+DAG ID: data_curation
+TaskNotebookClusterma_model_input_dataspark/data_prep/ma_model_input_dataPOP-ADVYZER-LARGE13.5 CMS HCC Scoring DAG (pop_advyzer_cms_hcc_score_dag.py)
+DAG ID: cms_hcc_risk_scoring
+TaskNotebookClustercms_hcc_risk_score_calcspark/cms/cms_hcc_risk_score_calcPOP-ADVYZER-LARGE13.6 CMS RxHCC Scoring DAG (pop_advyzer_cms_rxhcc_score_dag.py)
+DAG ID: cms_rxhcc_risk_scoring
+TaskNotebookClustercms_rxhcc_risk_score_calcspark/cms/cms_rxhcc_risk_score_calcPOP-ADVYZER-LARGE13.7 CMS ESRD Scoring DAG (pop_advyzer_cms_hcc_esrd_score_dag.py)
+DAG ID: cms_hcc_esrd_risk_scoring
+TaskNotebookClustercms_hcc_esrd_risk_score_calcspark/cms/cms_hcc_esrd_risk_score_calcPOP-ADVYZER-LARGE13.8 GP Curation DAG (pop_advyzer_gp_curation_dag.py)
+DAG ID: gp_curation
+TaskNotebookDepends Oncms_persistence_hccspark/cms/cms_persistence_hcc(start)gp_suspectingspark/gp_suspecting/gap_suspecting_maincms_persistence_hcc13.9 Utility DAGs
+DAG IDPurposepop_advyzer_plan_onboard_dagNew plan onboarding (DDL creation, permissions)pop_advyzer_grant_permission_dagGrant Unity Catalog permissionspop_advyzer_dml_operation_schema_dagSchema-level DML operationspop_advyzer_qualifying_claims_dagStandalone qualifying claims runpop_advyzer_reference_data_ingestion_dagLoad/refresh CMS reference data13.10 Airflow Task Execution Pattern
+All Databricks tasks are submitted via DatabricksSubmitRunOperator. The airflow_utils.py helper provides:
+# Cluster config resolution
+get_cluster_config(notebook, **kwargs)
+  ? Reads environment-specific cluster_config.yaml
+  ? Injects IAM instance profile ARN
+  ? Adds custom tags (billable, tenant, pod, billingcode, env)
+
+# Notebook parameters
+notebook_dict(notebook_task_name=..., **kwargs)
+  ? Reads param_values.yaml for default parameters
+  ? Merges dag_run.conf trigger parameters
+  ? Resolves notebook path from config
+
+# Email alerting
+failure_callback(context)  ? sends failure email with log URL
+success_callback(context)  ? sends success email
+
+14. Databricks Workflow (Asset Bundle)
+14.1 Bundle Overview
+The Databricks Asset Bundle (pop-advyzer-main-bundle) provides an alternative orchestration path to run the full Risk Engine pipeline directly in Databricks without Airflow.
+Bundle file: config/pop-advyzer-main-bundle/bundle.yaml
+Workflow file: config/pop-advyzer-main-bundle/workflow/pop_advyzer_main_wf.yaml
+14.2 Workflow Parameters
+ParameterDescriptionenvEnvironment (DEV/QA/STG/PROD)catalogDatabricks catalog nameplan_nameHealth plan identifiertablesComma-separated list of tables to processmonthProcessing month (MM)risk_yearRisk assessment year (YYYY)applicationModule to runmodelCMS model typehome_plan_idHealth plan ID filtercontractCMS contract IDtime_periodDiagnosis lookback periodincl_supplemental_mmrInclude MMR supplemental data (Y/N)incl_pseudo_claimInclude pseudo-claims (Y/N)hcc_versionCMS HCC model version (V24/V28)rxhcc_versionCMS RxHCC model version (V05/V08)esrd_versionCMS ESRD model version14.3 Task Dependency Graph
+data_loader_main
+      ?
+      ?
+data_transformation_common
+      ?
+      ???????????????????????????????????????
+      ?                                     ?
+qualifying_claims                    mor_health_events
+      ?                                     
+      ?                                     
+pseudo_claims                               
+      ?                                     ?
+      ???????????????????????????????????????
+                     ?
+             ma_model_input_data
+                     ?
+          ???????????????????????
+          ?          ?          ?
+cms_hcc_   cms_rxhcc_ cms_esrd_
+risk_score risk_score risk_score
+_calc      _calc      _calc
+14.4 Prerequisites Workflow
+Workflow file: config/pop-advyzer-prerequisites-bundle/workflow/pop_advyzer_prerequisites_wf.yaml
+Run once per new plan onboarding or when reference data changes:
+ddl_script_run
+      ?
+      ?
+dml_operation_schema
+      ?
+      ?
+load_reference_data_run
+      ?
+      ?
+grant_permission
+TaskNotebookDescriptionddl_script_runspark/plan_setup/ddl_script_runCreate all Delta tables for the plandml_operation_schemaspark/plan_setup/dml_operation_schemaInitialize schemas, apply DMLload_reference_data_runspark/plan_setup/load_reference_data_runLoad CMS reference data into ma_referencegrant_permissionspark/plan_setup/grant_permissionGrant Unity Catalog permissions to service principals
+15. Data Quality Framework
+15.1 Great Expectations Integration
+The platform uses Great Expectations (GE) to validate data at three pipeline stages:
+StageConfig FileValidation PointIngestionge_meta_ingestion.ymlAfter data_loader_main loads stage tablesTransformationge_meta_transformation.ymlAfter ingestion_to_transformation runsCurationge_meta_curation.ymlAfter ma_model_input_data curates data15.2 Validation Rules (dq_validation_rules.yml)
+Common validations applied across stages:
+Rule TypeExamplesNull checksexpect_column_values_to_not_be_null on key columns (BID, MEMBER_ID, SOURCE_LOAD_MONTH)Uniquenessexpect_column_values_to_be_unique on BID per tableValue rangeAge between 0 and 120; valid gender codes (M/F)Reference integrityDIAG_CD only contains valid ICD-10 codesSchema conformanceExpected columns present with correct typesCompletenessRow count above minimum threshold per plan15.3 Validate Notebook (src/spark/validate.py)
+The validate.py notebook orchestrates GE validations:
+1. Load GE config for the current stage (ingestion/transformation/curation)
+2. Connect to Databricks Delta tables
+3. Run expectation suite against current partition
+4. Generate HTML data docs to S3
+5. Fail the task if critical expectations fail
+6. Log results to validation_results table
+
+16. Utility and Helper Framework
+16.1 src/spark/helpers/databricks_util.py (1,144 lines)
+Core data access utilities used by all notebooks:
+FunctionDescriptionread_table(spark, schema, table, columns, filter, mandatory)Read Delta table with optional column selection and filterwrite_table(df, schema, table, mode, partition_cols)Write DataFrame to Delta tableupsert_delta_table(df, schema, table, merge_keys)Merge/upsert using Delta MERGEclean_up(df_list)Unpersist cached DataFramesget_plan_name(plan_name)Return plan-specific schema prefixload_csv(spark, path, schema, delimiter)Load CSV with enforced schemaload_txt(spark, path, schema, delimiter)Load pipe-delimited text filesget_dict_value(dict, key)UDF: extract value from string-format dictdedupe(array)UDF: deduplicate and sort array16.2 src/spark/helpers/transformations_commons.py (1,985 lines)
+Shared transformation logic for all CMS scoring models:
+FunctionDescriptionload_config_table(spark, config_schema, table_name, filter)Load and cache reference tableload_and_prepare_data(...)Orchestrate all data loading steps for scoringget_risk_member_filtered(...)Filter risk_member for plan/contract/time periodget_risk_member_diag_filtered(...)Filter risk_member_diag for time periodget_time_period_dates(spark, config_schema, time_period)Get start/end dates for diagnosis lookbackenrich_claims_with_member_data(...)JOIN diagnoses with member demographicsget_original_disability(df)Map OREC to disability/ESRD flagsassign_community_model(df)Assign CMS model segment per memberage_sex_sedits(df, coefficients, version)Compute demographic scores with SEDITSmap_icd_to_hcc(df, mapping)Translate ICD codes to HCC codesapply_hcc_hierarchy_rules(df, hierarchy)Apply hierarchy suppressionassign_scores(df, coefficients)Assign coefficient scores to HCCsadd_interaction_rules_and_calculate_score(df, interactions)Add interaction termscalculate_final_scores(df)Aggregate to member-level totalsnormalization_scores(df, factors)Apply CMS normalizationweighted_risk_score(df)Compute enrollment-weighted scores16.3 src/spark/helpers/config_util.py
+Configuration loading utilities:
+FunctionDescriptionget_config(env)Load values.yaml for the given environmentget_config_yaml(path)Load any YAML file by path16.4 src/spark/helpers/airflow_utils.py (286 lines)
+Airflow integration utilities:
+FunctionDescriptionload_values_config()Load values.yaml from CONFIG_DIRload_param_values_config()Load param_values.yamlsend_email(dag_id, task, message, emails, smtp)Send alert email via SMTPfailure_callback(context)Airflow on_failure_callbacksuccess_callback(context)Airflow on_success_callbackload_cluster_config_file(cluster_file, **kwargs)Load and inject cluster configget_cluster_config(notebook, **kwargs)Resolve cluster config for notebooknotebook_dict(notebook_task_name, **kwargs)Build Databricks notebook task dict
+17. CI/CD and Deployment
+17.1 Deployment Script (scripts/deploy.py)
+The deploy script handles:
+* Packaging notebooks for Databricks workspace upload
+* Deploying Databricks Asset Bundles per environment
+* Syncing Airflow DAG files to MWAA S3 bucket
+* Updating configuration YAML files per environment
+17.2 Environment Promotion
+DEV ? QA ? STG ? PROD
+  GitHub Actions pipeline per environment
+  Asset bundles deployed via: databricks bundle deploy --target {env}
+17.3 Cluster Configuration per Environment
+EnvironmentFilePurposeDEVconfig/environments/dev/cluster_config.yamlDevelopment clustersDEV (GE)config/environments/dev/ge_cluster_config.yamlGreat Expectations clusterQAconfig/environments/qa/cluster_config.yamlQA clustersSTGconfig/environments/stg/cluster_config.yamlStaging clustersPRODconfig/environments/prod/cluster_config.yamlProduction clusters17.4 Plan Onboarding Process
+To add a new health plan:
+1. Add plan_name entry to ref_home_plan reference table
+2. Trigger pop_advyzer_plan_onboard_dag with new plan_name
+   ? Creates {plan}_ingestion, {plan}_transformation, {plan}_curation, {plan}_gap_curation schemas
+   ? Runs DDL to create all tables in each schema
+   ? Grants permissions to plan-specific service principals
+3. Configure S3 inbox bucket path in data_loader_config.yaml
+4. Configure BID prefix mapping in ref_bid_mapping
+5. First run: trigger data_ingestion ? data_transformation ? data_curation ? cms_hcc_risk_scoring
+
+18. Configuration Reference
+18.1 config/constants/ma_ra_model_constants.yaml
+ParameterValuesDescriptionSEDITS_DIAG1['D66', 'D67']Hemophilia codes (sex edit)SEDITS_DIAG2COPD codesCOPD sex edit codesSEDITS_DIAG3['C50.*']Breast cancer (female-only)SEDITS_DIAG4['P04.*']Neonatal drug exposureMA_REFERENCE['ma_reference']Reference schema list18.2 config/constants/data_loader_config.yaml
+ParameterValueDescriptionsrc_file_dir/Volumes/pop_{env}/volumes/bhi-pop-{env}-datalake-{plan_name}inbox-us-east-1Source file Volume pathingestion_file_dir/Volumes/pop_{env}/{plan_name}ingestion/ingestion/src_filesStaging Volume patharchive_dir/Volumes/pop_{env}/{plan_name}ingestion/ingestion/archiveArchive Volume pathfile_names18 file typesList of all expected file typessupplemental_file_names[mmr, mao_004, mor]Supplemental file typesMAO_FILE_TYPEmao_supplemental_dxMAO-004 type identifier18.3 config/sql/file_read_meta.yaml
+Defines column structure for all data models. Key sections:
+SectionPurposeMEMBERS_COLUMNSstage_member expected columnsMEMBER_ENROLLMENT_COLUMNSstage_member_enrollment columnsRISK_MEMBER_COLUMNSrisk_member schema definitionRISK_MEMBER_DIAG_COLUMNSrisk_member_diag schema definitionRISK_MEMBER_OUTPUT_COLUMNS30 output columns for curated risk_memberRISK_MEMBER_HCC_COLUMNS27 columns for risk_member_hcc tableRISK_MEMBER_HCC_SUMMARY_COLUMNSAggregated HCC summary columnsMEMBER_PERSISTENCE_HCC_COLUMNS27 columns for persistence tableSUPPLEMENTAL_MMR_RENAME_MAP10 CMS-to-internal column renames for MMRQUALIFIED_FACILITY_COLUMNSQualifying facility claim columnsQUALIFIED_PROFOTHER_COLUMNSQualifying professional claim columnsQUALIFIED_SUPPLEMENTAL_MAO_COLUMNSQualifying MAO-004 columnsSTAGE_LOAD_TABLESList of all stage tablesGAP_STAGE_LOAD_TABLESList of gap-related stage tablesPREREQUISITE_TABLESMEMBER_ID, RISK_PROV, RISK_LOCATION
+End of Risk Engine Technical Documentation
+

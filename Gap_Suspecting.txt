@@ -1,0 +1,655 @@
+Population Advyzer — Gap Suspecting Engine
+Technical Documentation
+Version: 1.0
+Platform: Databricks on AWS | Apache Airflow (MWAA)
+
+Table of Contents
+1. Solution Design Summary
+2. Data Architecture and Data Models
+3. Reference Data for Gap Suspecting
+4. Method 1 — Diagnosis-Based Gap Identification
+5. Method 2 — Procedure-Based Gap Identification
+6. Method 10 — Multi-Step Exclusion Logic
+7. Method 4 — Persistent Condition Carryforward
+8. Two-Level Suppression Logic
+9. Frequency and Confidence Scoring
+10. risk_member_hcc Integration
+11. Airflow DAG Orchestration
+12. Performance Characteristics and Optimization
+13. Key Functions Reference
+14. Configuration Reference
+
+1. Solution Design Summary
+1.1 Business Purpose
+The Gap Suspecting Engine identifies Medicare Advantage (MA) members who have chronic conditions that were historically documented but have not been re-captured in the current risk year. These are called "suspected gaps."
+When a health plan submits risk adjustment data to CMS, every qualifying HCC (Hierarchical Condition Category) must be re-documented at least once in the measurement year. If a member's chronic condition — diabetes, heart failure, COPD, etc. — goes undocumented, the plan loses the associated Risk Adjustment revenue for that member in that year.
+Gap suspecting surfaces these at-risk members and conditions to clinical teams before the RAPS/EDGE submission deadline, enabling targeted outreach, chart reviews, and care management.
+Financial Impact: Each identified and re-captured HCC is worth $3,000–$8,000 in annual risk-adjusted premium per member.
+1.2 High-Level Architecture
+?????????????????????????????????????????????????????????????????????????????????
+?                       GAP SUSPECTING ENGINE                                   ?
+?????????????????????????????????????????????????????????????????????????????????
+?                                                                               ?
+?  ????????????????????????????????????????????????????????????????????????    ?
+?  ?                     INPUT DATA                                       ?    ?
+?  ?                                                                      ?    ?
+?  ?  risk_member_hcc      ??? Current-year HCC assignments               ?    ?
+?  ?  member_persistence_hcc ? Prior-year historical HCC records          ?    ?
+?  ?  risk_member          ??? Member demographics (age, gender, plan)    ?    ?
+?  ?  risk_member_diag     ??? Current-year claims evidence               ?    ?
+?  ?  ref_method_metadata  ??? Method definitions (1, 2, 4, 10)          ?    ?
+?  ?  ref_method_codegroups ?? ICD code groups per method                 ?    ?
+?  ????????????????????????????????????????????????????????????????????????    ?
+?                                   ?                                          ?
+?                                   ?                                          ?
+?  ????????????????????????????????????????????????????????????????????????    ?
+?  ?                  FOUR SUSPECTING METHODS                             ?    ?
+?  ?                                                                      ?    ?
+?  ?  Method 1: Diagnosis-Based  ??? HCC in prior year, no ICD this year  ?    ?
+?  ?  Method 2: Procedure-Based  ??? Treatment procedures without DX code ?    ?
+?  ?  Method 10: Multi-Exclusion ??? Complex scenario-based identification ?    ?
+?  ?  Method 4: Persistence      ??? Carry forward confirmed chronic HCCs ?    ?
+?  ????????????????????????????????????????????????????????????????????????    ?
+?                                   ?                                          ?
+?                                   ?                                          ?
+?  ????????????????????????????????????????????????????????????????????????    ?
+?  ?                    SUPPRESSION LOGIC                                 ?    ?
+?  ?                                                                      ?    ?
+?  ?  Suppression 1: Remove already-documented conditions                 ?    ?
+?  ?  Suppression 2: Remove plan-excluded methods/conditions              ?    ?
+?  ????????????????????????????????????????????????????????????????????????    ?
+?                                   ?                                          ?
+?                                   ?                                          ?
+?  ????????????????????????????????????????????????????????????????????????    ?
+?  ?                    OUTPUT TABLES                                     ?    ?
+?  ?                                                                      ?    ?
+?  ?  draft_gaps              ??? Raw suspected gaps (before details)     ?    ?
+?  ?  draft_gaps_with_details ??? Gaps enriched with member/claim data    ?    ?
+?  ?  suspected_gaps          ??? Final suspected gaps with frequency     ?    ?
+?  ????????????????????????????????????????????????????????????????????????    ?
+?????????????????????????????????????????????????????????????????????????????????
+
+ORCHESTRATION: Apache Airflow ? pop_advyzer_gp_curation_dag
+               Runs AFTER: cms_persistence_hcc (prerequisite)
+COMPUTE:       Databricks POP-ADVYZER-LARGE cluster
+SCALES TO:     425+ million records (across all plans / methods)
+1.3 Data Flow Summary
+cms_persistence_hcc (prerequisite run)
+         ?
+         ?
+member_persistence_hcc  ???????????????????????????
+                                                   ?
+risk_member_hcc (current year) ?????????????????????
+                                                   ?
+risk_member + risk_member_diag ????  call_gp_suspecting_main()
+                                                   ?
+                        ????????????????????????????
+                        ?                          ?
+                        ?                          ?
+              Method 1 candidates       Method 10 candidates
+              Method 2 candidates       Method 4 candidates
+                        ?                          ?
+                        ????????????????????????????
+                                   ?
+                          get_method_wise_inclusion()
+                                   ?
+                                   ?
+                          save_to_draft_gaps_table()
+                          PARTITIONED BY (SOURCE_LOAD_MONTH,
+                                          HOME_PLAN_ID_CD, METHOD_ID)
+                                   ?
+                                   ?
+                   add_suppression1_on_draft_gap()   ? remove already documented
+                   add_suppression2_on_draft_gap()   ? remove plan exclusions
+                                   ?
+                                   ?
+                   two_level_suppression_logic_final()
+                                   ?
+                                   ?
+                   save_to_draft_gaps_with_details_table()
+                                   ?
+                                   ?
+                   save_to_suspected_gaps_with_frequency()
+                                   ?
+                                   ?
+                          suspected_gaps (final output)
+1.4 Key Design Principles
+PrincipleImplementationMethod modularityEach suspecting method runs independently via method_list parameterMulti-tenant isolationAll gap tables partitioned by HOME_PLAN_ID_CD for plan isolationIdempotent writesAll writes use sourceLoadMonth-scoped partition overwritesHCC-level granularityOne gap suspect row per member per HCC per methodTwo-level suppressionSuppression 1 (documentation) and Suppression 2 (plan exclusions) applied in sequenceFrequency scoringHow many times a method identifies a member-condition pair drives confidence180-day lookbackMethod 10 uses a 180-day claim window for evidence evaluationPerformance partitioning(SOURCE_LOAD_MONTH, HOME_PLAN_ID_CD, METHOD_ID) for all gap tables
+2. Data Architecture and Data Models
+2.1 Gap Schema Structure
+pop_{env}
+??? {plan}_gap_curation     ? All gap suspecting output tables
+?     ??? draft_gaps
+?     ??? draft_gaps_with_details
+?     ??? suspected_gaps
+?
+??? {plan}_curation         ? Input tables from risk engine
+      ??? risk_member
+      ??? risk_member_diag
+      ??? risk_member_hcc
+      ??? member_persistence_hcc
+2.2 Output Table: draft_gaps
+The initial output of each suspecting method. Holds raw gap suspects before enrichment and suppression.
+ColumnTypeDescriptionBIDSTRINGMember surrogate keyMEMBER_IDSTRINGSource member identifierHOME_PLAN_ID_CDSTRINGHealth plan IDCONTRACT_IDSTRINGCMS contract identifierHCC_CODESTRINGSuspected HCC codeHCC_LABELSTRINGHCC descriptionMODELSTRINGCMS model (CMS-HCC/RxHCC/ESRD)MODEL_VERSIONSTRINGModel version (V24/V28)METHOD_IDINTEGERGap suspecting method (1/2/4/10)METHOD_NAMESTRINGMethod name descriptionDIAG_CDSTRINGICD-10 diagnosis code evidenceLAST_DOSDATELast date of service for conditionIS_SUPPRESSED_1STRINGSuppression 1 flag (Y/N)IS_SUPPRESSED_2STRINGSuppression 2 flag (Y/N)RISK_YEARSTRINGRisk assessment yearSOURCE_LOAD_MONTHSTRINGProcessing month (YYYY_MM)CYCLE_RUNSTRINGCycle run identifierBHI_CREATED_TSTIMESTAMPRecord created timestampPartition: (SOURCE_LOAD_MONTH, HOME_PLAN_ID_CD, METHOD_ID)
+Properties: delta.autoOptimize.optimizeWrite = 'true', delta.autoOptimize.autoCompact = 'true'
+2.3 Output Table: draft_gaps_with_details
+Enriched version of draft_gaps with additional member, clinical, and provider information.
+ColumnTypeDescriptionBIDSTRINGMember surrogate keyMEMBER_IDSTRINGSource member identifierHOME_PLAN_ID_CDSTRINGHealth plan IDMEMBER_FIRST_NAMESTRINGMember first nameMEMBER_LAST_NAMESTRINGMember last nameDATE_OF_BIRTHDATEMember date of birthGENDERSTRINGMember genderAGEINTEGERMember age as of risk yearHCC_CODESTRINGSuspected HCC codeHCC_LABELSTRINGHCC descriptionMETHOD_IDINTEGERGap method identifierMETHOD_NAMESTRINGMethod descriptionDIAG_CDSTRINGEvidence ICD-10 codeDIAG_DESCRIPTIONSTRINGICD code descriptionLAST_DOSDATELast date of servicePROVIDER_NPISTRINGLast treating provider NPIPROVIDER_NAMESTRINGProvider nameFACILITY_TYPE_CDSTRINGFacility typeCLAIM_TYPESTRINGClaim type for evidenceIS_SUPPRESSED_1STRINGDocumentation suppression flagIS_SUPPRESSED_2STRINGPlan exclusion suppression flagFREQUENCY_COUNTINTEGERTimes this gap was identifiedRISK_YEARSTRINGRisk assessment yearSOURCE_LOAD_MONTHSTRINGProcessing monthCYCLE_RUNSTRINGCycle run identifierBHI_CREATED_TSTIMESTAMPRecord created timestampPartition: (SOURCE_LOAD_MONTH, HOME_PLAN_ID_CD, METHOD_ID)
+2.4 Output Table: suspected_gaps (Final Output)
+Final suspect gap records after suppression, enrichment, and frequency scoring. This is the table consumed by downstream BI dashboards and care management systems.
+ColumnTypeDescriptionBIDSTRINGMember surrogate keyMEMBER_IDSTRINGSource member identifierHOME_PLAN_ID_CDSTRINGHealth plan IDCONTRACT_IDSTRINGCMS contract identifierMEMBER_FIRST_NAMESTRINGMember first nameMEMBER_LAST_NAMESTRINGMember last nameDATE_OF_BIRTHDATEMember date of birthGENDERSTRINGMember genderAGEINTEGERMember ageHCC_CODESTRINGSuspected HCC codeHCC_LABELSTRINGHCC descriptionMODELSTRINGCMS modelMODEL_VERSIONSTRINGModel versionMETHOD_IDINTEGERSource methodMETHOD_NAMESTRINGMethod nameDIAG_CDSTRINGSupporting diagnosis codeDIAG_DESCRIPTIONSTRINGDiagnosis descriptionLAST_DOSDATELast date of servicePROVIDER_NPISTRINGProvider NPIPROVIDER_NAMESTRINGProvider nameFREQUENCYINTEGERHow many methods identified this gapCONFIDENCE_SCOREDECIMALGap confidence score (0.0–1.0)IS_SUPPRESSEDSTRINGFinal suppression flag (Y/N)RISK_YEARSTRINGRisk assessment yearSOURCE_LOAD_MONTHSTRINGProcessing monthCYCLE_RUNSTRINGCycle run identifierBHI_CREATED_TSTIMESTAMPCreated timestampBHI_UPDATED_TSTIMESTAMPUpdated timestampPartition: (SOURCE_LOAD_MONTH, HOME_PLAN_ID_CD, METHOD_ID)
+2.5 Input Table: risk_member_hcc
+Current-year HCC assignments from the Risk Engine. Primary evidence source for gap identification.
+ColumnDescriptionBIDMember surrogate keyHCC_CODEAssigned HCC codeMODELCMS modelMODEL_VERSIONModel versionDIAG_CDSupporting ICD codeSERVICE_FROM_DTService from dateCLAIM_TYPESource claim typeIS_PAYMENT_HCCPayment HCC flagSCORE_CONTRIBUTIONScore contributionCYCLE_RUNCycle run identifierMETHOD_IDGap method identifierSOURCE_LOAD_MONTHProcessing monthPartition: (CYCLE_RUN, HOME_PLAN_ID_CD, METHOD_ID)
+2.6 Input Table: member_persistence_hcc
+3-year rolling HCC history. The backbone of gap identification — members with "Closed" status in prior years are the primary gap suspects.
+ColumnDescriptionBIDMember surrogate keyHCC_CODEHistorical HCC codeSTATUSOpen / Persistent / Closed / SuspectIS_PERSISTENTY/N persistence flagDIAGNOSIS_YEARYear first diagnosedLATEST_CLAIM_DTMost recent supporting claimOLDEST_CLAIM_DTOldest supporting claimCLAIM_COUNTTotal supporting claimsRISK_YEARRisk year record applies toCYCLE_RUNCycle run identifier
+3. Reference Data for Gap Suspecting
+3.1 ma_reference.ref_method_metadata
+Defines the four gap suspecting methods. Controls which methods are active and their behavior.
+ColumnDescriptionMETHOD_IDUnique method ID (1, 2, 4, 10)METHOD_NAMEMethod name (e.g., "Diagnosis-Based Gap")METHOD_DESCRIPTIONDetailed method descriptionPROGRAMProgram (MA/HEDIS/etc.)IS_ACTIVEActive flag (Y/N)PRIORITYExecution priority orderPartition: (METHOD_ID, PROGRAM)
+3.2 ma_reference.ref_method_metadata_codegroups
+ICD code groups for each method. Defines which ICD codes are relevant to each method's gap identification logic.
+ColumnDescriptionMETHOD_IDForeign key to ref_method_metadataCODE_GROUP_IDCode group identifierCODE_GROUP_NAMEGroup name (e.g., "DIABETES_CODES")ICD_CDICD-10 code in this groupICD_VERICD versionDESCRIPTIONICD code descriptionPartition: ICD_VER
+3.3 ma_reference.ref_chronic_condition
+Defines chronic conditions relevant to MA risk adjustment that require annual re-documentation.
+ColumnDescriptionCONDITION_IDUnique condition identifierCONDITION_NAMECondition nameHCC_CODEAssociated HCC code(s)ICD_CODE_LISTList of qualifying ICD codesIS_ANNUALAnnual re-documentation required (Y/N)PROGRAMProgram (MA/etc.)3.4 ma_reference.ref_method_frequency
+Controls how often each gap method runs (monthly, quarterly, annually).
+ColumnDescriptionMETHOD_IDForeign key to ref_method_metadataFREQUENCYRun frequency: monthly/quarterly/annualEFFECTIVE_FROM_DTEffective from dateEFFECTIVE_TO_DTEffective to date3.5 ma_reference.ref_method_prior_year
+Prior-year condition lookback configuration for gap methods.
+ColumnDescriptionMETHOD_IDForeign key to ref_method_metadataLAST_DX_OCCURANCENumber of prior years to look backCONDITION_TYPECondition categoryPartition: LAST_DX_OCCURANCE
+
+4. Method 1 — Diagnosis-Based Gap Identification
+4.1 Business Logic
+Method 1 identifies members who had an HCC-qualifying diagnosis in a prior year but have no claim in the current risk year supporting that HCC. The logic is:
+"Member had ICD code X (maps to HCC Y) in Year N-1. In Year N, there is no claim with any ICD code that maps to HCC Y. Therefore, HCC Y is a suspected gap."
+4.2 Processing Steps
+Step 1: Load prior-year persistence records
+  ? Filter member_persistence_hcc WHERE STATUS = 'Closed'
+  ? These are HCCs present before but absent in current year
+  ? Filter by RISK_YEAR = current_risk_year
+
+Step 2: Load current-year HCC assignments
+  ? Filter risk_member_hcc WHERE SOURCE_LOAD_MONTH = current_month
+  ? These represent already-documented HCCs
+
+Step 3: Anti-join
+  ? Prior-year HCCs NOT IN current-year HCCs
+  ? JOIN key: (BID, HCC_CODE, MODEL, MODEL_VERSION)
+  ? Result: candidate gaps — HCCs seen before but not this year
+
+Step 4: Filter by method code groups
+  ? Load ref_method_metadata_codegroups for METHOD_ID = 1
+  ? Only retain HCCs in the configured code groups for Method 1
+  ? This limits Method 1 to specific chronic condition categories
+
+Step 5: Add method metadata
+  ? Join with ref_method_metadata for METHOD_ID = 1
+  ? Add METHOD_NAME, METHOD_DESCRIPTION
+
+Step 6: Add evidence (last known diagnosis)
+  ? Join with member_persistence_hcc for LAST_DOS
+  ? Source DIAG_CD from the last supporting claim in persistence history
+
+Step 7: Write to draft_gaps
+  ? PARTITION (SOURCE_LOAD_MONTH, HOME_PLAN_ID_CD, METHOD_ID=1)
+4.3 Key Function
+# In gap_suspecting_helper.py
+def get_method_wise_inclusion(spark, catalog, gap_schema_curation, schema,
+                               method_list, risk_year, no_of_year,
+                               source_load_year_month, logger):
+    """
+    Orchestrates all method-wise gap identification.
+    Returns combined suspected gap DataFrame for all active methods.
+    """
+
+5. Method 2 — Procedure-Based Gap Identification
+5.1 Business Logic
+Method 2 identifies gaps through treatment procedures rather than diagnosis codes. The logic is:
+"Member received procedure P (e.g., insulin injection, dialysis) which strongly implies condition C (e.g., Diabetes, ESRD). If no claim in the risk year contains an ICD code for condition C, it is a suspected gap."
+This catches cases where providers document the treatment but omit the underlying chronic condition diagnosis code.
+5.2 Processing Steps
+Step 1: Load current-year claims
+  ? Filter risk_member_diag for current SOURCE_LOAD_MONTH
+  ? Focus on PROCEDURE_CD columns (CPT, HCPCS)
+
+Step 2: Load Method 2 procedure-to-condition mapping
+  ? From ref_method_metadata_codegroups (PROCEDURE_CODES section)
+  ? Maps CPT/HCPCS procedure codes to implied HCC conditions
+
+Step 3: Match claims to procedure groups
+  ? JOIN risk_member_diag.PROCEDURE_CD with codegroups.ICD_CD
+  ? Identify members who received qualifying procedures
+
+Step 4: Check for corresponding diagnosis documentation
+  ? For each member with qualifying procedure: check if supporting ICD code present
+  ? Anti-join: procedures without matching ICD documentation = gap candidates
+
+Step 5: Translate to HCC codes
+  ? Map the implied condition to HCC codes using icd_hcc_mapping
+  ? Filter: only HCCs not already present in risk_member_hcc
+
+Step 6: Apply persistence filter
+  ? Cross-check with member_persistence_hcc
+  ? Only include if condition was documented in a prior year
+  ? (New conditions without history are not gap suspects)
+
+Step 7: Write to draft_gaps
+  ? METHOD_ID = 2
+5.3 Method 2 vs. Method 1 Comparison
+AspectMethod 1Method 2Evidence sourceDiagnosis codes (ICD)Procedure codes (CPT/HCPCS)Gap signalMissing ICD re-documentationProcedure implies undocumented DXHistorical requirementYes (prior-year HCC)Yes (prior-year HCC condition)False positive riskLowerHigher (implied conditions)Typical volumeHighModerate
+6. Method 10 — Multi-Step Exclusion Logic
+6.1 Business Purpose
+Method 10 is the most complex and computationally intensive method. It identifies gaps through a sophisticated multi-scenario exclusion analysis with a 180-day claim lookback window.
+Method 10 processes two distinct scenarios:
+ScenarioDescriptionScenario 1Prior-year HCC with no supporting evidence within 180-day lookback windowScenario 2Prior-year HCC present, current-year evidence exists but fails specific validation rules6.2 Scenario 1 Processing — 180-Day Lookback
+Step 1: load_method_exclusions_10
+  ? Load all exclusion rules for Method 10 from ref_method_metadata_codegroups
+  ? Exclusion categories:
+    - EXCLUDED_HCC: HCCs exempt from Method 10 analysis
+    - EXCLUDED_ICD: ICD codes that exclude the member from suspecting
+    - EXCLUDED_PROC: Procedure codes that indicate gap is closed
+    - EXCLUDED_FACILITY: Facility types excluded from evidence evaluation
+
+Step 2: get_scenario1_gap_claims_optimized
+  ? Look back 180 days from SOURCE_LOAD_MONTH end date
+  ? Load all claims within the 180-day window
+  ? Filter out claims from excluded facility types
+  ? Filter out claims containing excluded ICD codes
+  ? Result: valid evidence claims within window
+
+Step 3: Anti-join with current HCC assignments
+  ? For each member-HCC combination in persistence history
+  ? Check if valid evidence exists within 180-day window
+  ? No valid evidence = Scenario 1 gap candidate
+
+Step 4: Apply HCC-level exclusions
+  ? Remove any gaps where the HCC itself is in EXCLUDED_HCC list
+  ? Remove members with EXCLUDED_ICD codes (comorbidity exclusions)
+
+Step 5: De-duplicate scenario 1 results
+  ? Same member-HCC may appear from multiple prior-year records
+  ? Keep most recent LAST_DOS as evidence date
+6.3 Scenario 2 Processing — Validation Rule Failures
+Step 1: Identify members with some current-year evidence
+  ? Members who DO have a claim in the study period for the condition
+  ? But the claim fails one or more validation rules
+
+Step 2: Apply validation rules
+  ? Rule A: Evidence claim must be from valid claim type (no excluded facility types)
+  ? Rule B: ICD code must be primary or secondary (not incidental)
+  ? Rule C: Provider must have valid NPI (not anonymous/placeholder)
+  ? Rule D: Claim must not be reversed/adjusted to zero
+
+Step 3: Records failing any validation rule = Scenario 2 gap
+  ? flag IS_SCENARIO_2 = 'Y' in draft_gaps
+
+Step 4: Combine Scenario 1 and Scenario 2 results
+  ? UNION of both scenario outputs
+  ? Add METHOD_ID = 10 to all records
+6.4 Key Functions for Method 10
+# In gap_suspecting_helper.py
+
+def load_method_exclusions_10(spark, catalog, ma_reference, method_id, logger):
+    """
+    Loads all exclusion rules for Method 10 from reference tables.
+    Returns dict of exclusion DataFrames keyed by exclusion category.
+    """
+
+def get_scenario1_gap_claims_optimized(spark, catalog, schema, schema_curation,
+                                        risk_year, no_of_year, plan_name,
+                                        source_load_year_month, exclusions,
+                                        logger):
+    """
+    Optimized implementation of Scenario 1 gap identification.
+    Uses 180-day lookback window with vectorized operations for performance.
+    
+    Performance optimization: broadcasts exclusion tables to avoid shuffle joins.
+    Pushes filters early in the plan to reduce data scanned.
+    """
+6.5 Method 10 Performance
+Method 10 is the most resource-intensive step, historically taking up to 5 minutes on large plan datasets. The optimized implementation uses:
+* Broadcast joins for exclusion tables (small reference data)
+* Predicate pushdown to reduce data scanned
+* Early partition filtering using SOURCE_LOAD_MONTH
+* Avoidance of CROSSJOIN through proper join key design
+* Optimized anti-join patterns instead of NOT EXISTS subqueries
+
+7. Method 4 — Persistent Condition Carryforward
+7.1 Business Logic
+Method 4 addresses a specific scenario in MA risk adjustment:
+"Member has a chronic condition that CMS considers permanently established once documented. These conditions should be automatically carried forward to the current risk year as an active gap suspect if not re-documented."
+Examples: Amputation, certain neurological conditions, severe cognitive impairment. These are conditions that, once diagnosed, do not resolve — so if no claim documents them in the current year, the gap is almost certainly real.
+7.2 Processing Steps
+Step 1: Load permanent/persistent condition list
+  ? From ref_chronic_condition WHERE IS_ANNUAL = 'N' (not annual — permanent)
+  ? OR from ref_method_metadata_codegroups for METHOD_ID = 4
+
+Step 2: Filter member_persistence_hcc for permanent conditions
+  ? WHERE HCC_CODE IN (permanent condition HCC list)
+  ? WHERE IS_PERSISTENT = 'Y' (confirmed in prior year)
+  ? WHERE STATUS != 'Closed' (still tracked as active)
+
+Step 3: Check current-year documentation
+  ? Anti-join with risk_member_hcc
+  ? Members with no current-year documentation = Method 4 gap candidates
+
+Step 4: Apply persistence lookback
+  ? DIAGNOSIS_YEAR must be within prior_years window (default: 2 years)
+  ? Ensures carryforward is from recent, verified diagnoses
+
+Step 5: Add high-confidence flag
+  ? Method 4 gaps receive elevated CONFIDENCE_SCORE
+  ? Permanent conditions are near-certain gaps if not re-documented
+
+Step 6: Write to draft_gaps
+  ? METHOD_ID = 4
+7.3 Method 4 Characteristics
+CharacteristicValueTypical volumeLowest of four methodsAccuracy/precisionHighest (permanent conditions)Confidence scoreHigh (0.8–1.0)Clinical actionImmediate — conditions unlikely to have resolvedLookback periodControlled by prior_years parameter
+8. Two-Level Suppression Logic
+8.1 Overview
+After all four methods generate draft gap records, a two-level suppression process removes false positives before the final suspected_gaps table is populated.
+draft_gaps
+    ?
+    ?  add_suppression1_on_draft_gap()
+Suppression 1: Remove already-documented gaps (IS_SUPPRESSED_1)
+    ?
+    ?  add_suppression2_on_draft_gap()
+Suppression 2: Remove plan-level exclusions (IS_SUPPRESSED_2)
+    ?
+    ?  two_level_suppression_logic_final()
+Apply final combined suppression filter ? unsuppressed records only
+    ?
+    ?
+draft_gaps_with_details (enriched, suppression-flagged)
+    ?
+    ?
+suspected_gaps (IS_SUPPRESSED = 'N' only)
+8.2 Suppression 1 — Documentation Evidence Check
+Function: add_suppression1_on_draft_gap()
+Suppression 1 marks a gap record as suppressed if documentation evidence was found in the current risk year, meaning the condition IS actually captured — the draft gap was a false positive.
+For each draft_gap record (BID, HCC_CODE):
+
+  Check: Does risk_member_hcc contain a record for this (BID, HCC_CODE)
+         in the current risk year (SOURCE_LOAD_MONTH)?
+
+  If YES: IS_SUPPRESSED_1 = 'Y' (condition is documented ? not a real gap)
+  If NO:  IS_SUPPRESSED_1 = 'N' (condition is not documented ? keep as gap)
+Additional Suppression 1 rules:
+* If member has a claim with a higher-hierarchy HCC (HCC absorbs the suspect HCC), suppress the lower-hierarchy gap
+* If the gap HCC is an interaction term already captured via another HCC path, suppress it
+* If member is deceased or disenrolled before risk year end, suppress all gaps
+8.3 Suppression 2 — Plan-Level Exclusions
+Function: add_suppression2_on_draft_gap()
+Suppression 2 marks a gap record as suppressed based on plan-specific or method-specific exclusion rules. This separates clinical exclusions from documentation status.
+For each draft_gap record (BID, HCC_CODE, METHOD_ID):
+
+  Check 1: Is this METHOD_ID excluded for this HOME_PLAN_ID_CD?
+    ? Some plans may opt-out of specific gap methods
+    ? IS_SUPPRESSED_2 = 'Y' if method excluded for plan
+
+  Check 2: Is this HCC_CODE in the method's EXCLUDED_HCC list?
+    ? Certain HCCs are globally excluded from suspecting
+    ? E.g., HCCs with high false-positive rates
+    ? IS_SUPPRESSED_2 = 'Y' if HCC excluded
+
+  Check 3: Does the member have a contradicting ICD code?
+    ? Some ICD codes indicate the condition has resolved or been superseded
+    ? Load CONTRADICTING_ICD list from ref_method_metadata_codegroups
+    ? IS_SUPPRESSED_2 = 'Y' if contradicting code found
+
+  Check 4: Is the gap within an active prior authorization / care plan?
+    ? If plan has flagged the member as actively being treated
+    ? IS_SUPPRESSED_2 = 'Y'
+8.4 two_level_suppression_logic_final()
+After both suppression flags are set, this function applies the final combined filter:
+def two_level_suppression_logic_final(draft_gaps_df):
+    """
+    Applies final suppression: a gap is suppressed if EITHER
+    IS_SUPPRESSED_1 = 'Y' OR IS_SUPPRESSED_2 = 'Y'.
+    
+    Unsuppressed records (both = 'N') proceed to suspected_gaps.
+    Suppressed records are retained in draft_gaps_with_details with flags set,
+    providing full audit trail of suppression decisions.
+    """
+    return draft_gaps_df.withColumn(
+        "IS_SUPPRESSED",
+        when(
+            (col("IS_SUPPRESSED_1") == "Y") | (col("IS_SUPPRESSED_2") == "Y"),
+            lit("Y")
+        ).otherwise(lit("N"))
+    )
+8.5 Suppression Audit Trail
+Both suppression flags AND the final IS_SUPPRESSED column are retained in draft_gaps_with_details. This provides:
+* Full audit trail for clinical review
+* Ability to analyze false positive rates by method and plan
+* Input for suppression rule tuning
+
+9. Frequency and Confidence Scoring
+9.1 Frequency Calculation
+Function: save_to_suspected_gaps_with_frequency()
+Frequency counts how many distinct methods identified the same member-HCC gap:
+Member A, HCC 19 (Diabetes):
+  ? Identified by Method 1 (prior-year persistence):    COUNT +1
+  ? Identified by Method 10 Scenario 1 (180-day):      COUNT +1
+  ? Not identified by Method 2 (no procedure evidence):  --
+  ? Not identified by Method 4 (not permanent):          --
+  
+FREQUENCY = 2
+A higher frequency score means multiple independent methods corroborate the gap, increasing clinical confidence.
+def save_to_suspected_gaps_with_frequency(
+    spark, catalog, gap_schema_curation, schema_curation, ma_reference,
+    risk_year, source_load_year_month, plan_name, current_user, logger
+):
+    """
+    Aggregates draft_gaps_with_details by (BID, HCC_CODE, MODEL, MODEL_VERSION).
+    Computes:
+      - FREQUENCY: count of distinct METHOD_IDs that flagged this gap
+      - CONFIDENCE_SCORE: normalized frequency-based confidence
+      - LAST_DOS: most recent date of service across all methods
+    Writes final record to suspected_gaps.
+    """
+9.2 Confidence Score Computation
+CONFIDENCE_SCORE = FREQUENCY / MAX_POSSIBLE_METHODS
+
+Where MAX_POSSIBLE_METHODS = number of active methods in method_list parameter.
+
+Example:
+  method_list = [1, 2, 10, 4]  ? MAX = 4
+  FREQUENCY = 2                 ? CONFIDENCE = 2/4 = 0.50
+
+  FREQUENCY = 4                 ? CONFIDENCE = 4/4 = 1.00 (all methods agree)
+  FREQUENCY = 1                 ? CONFIDENCE = 1/4 = 0.25 (single signal)
+9.3 Suspected Gaps Aggregation Logic
+When writing to suspected_gaps, the engine aggregates at the member-HCC level:
+GROUP BY (BID, MEMBER_ID, HOME_PLAN_ID_CD, HCC_CODE, MODEL, MODEL_VERSION, RISK_YEAR)
+
+AGGREGATE:
+  FREQUENCY        = COUNT(DISTINCT METHOD_ID)
+  CONFIDENCE_SCORE = FREQUENCY / MAX_METHODS
+  LAST_DOS         = MAX(LAST_DOS across all methods)
+  PROVIDER_NPI     = FIRST(PROVIDER_NPI) from most-recent method evidence
+  DIAG_CD_LIST     = COLLECT_SET(DIAG_CD) — all supporting ICD codes
+  METHOD_LIST      = COLLECT_SET(METHOD_ID) — which methods identified it
+
+10. risk_member_hcc Integration
+10.1 Why risk_member_hcc Matters for Gap Suspecting
+risk_member_hcc is the output of the Risk Engine scoring models. For gap suspecting, it serves two roles:
+1. Current-year documentation evidence: If a member has an HCC in risk_member_hcc for the current SOURCE_LOAD_MONTH, that HCC is NOT a gap (it's been captured).
+2. Method-tagged HCC tracking: The METHOD_ID column in risk_member_hcc links each HCC assignment back to which gap suspecting method drove its identification.
+10.2 HCC-to-Gap Feedback Loop
+Risk Engine Run #1 (initial):
+  ? cms_hcc_risk_score_calc produces risk_member_hcc (METHOD_ID = NULL)
+  
+Gap Suspecting Run:
+  ? gap_suspecting_main identifies gaps, writes to suspected_gaps
+  ? Updates risk_member_hcc with METHOD_ID for newly-suspected conditions
+  
+Risk Engine Run #2 (after gap capture):
+  ? cms_hcc_risk_score_calc includes gap-sourced diagnoses
+  ? risk_member_hcc updated with method-tagged records
+  ? suspected_gaps suppressed for now-documented conditions (IS_SUPPRESSED_1 = 'Y')
+10.3 get_method_metadata_df
+def get_method_metadata_df(spark, catalog, ma_reference, method_list, logger):
+    """
+    Loads active method metadata for the specified method_list.
+    Returns DataFrame with METHOD_ID, METHOD_NAME, PROGRAM, IS_ACTIVE.
+    Used to validate method_list and join metadata to gap records.
+    """
+
+11. Airflow DAG Orchestration
+11.1 GP Curation DAG (pop_advyzer_gp_curation_dag.py)
+DAG ID: gp_curation
+Trigger: Via main_dag with application='gp_curation'
+Cluster: POP-ADVYZER-LARGE (required for 400M+ record processing)
+Task Flow:
+  cms_persistence_hcc     ? prerequisite: builds member_persistence_hcc
+          ?
+          ?
+  gp_suspecting           ? runs gap_suspecting_main with all 4 methods
+11.2 Gap Suspecting Notebook Entry Point (gap_suspecting_main.py)
+The Databricks notebook that orchestrates the full gap suspecting pipeline.
+Widget Parameters:
+ParameterDescriptionDefaultenvEnvironment (DEV/QA/STG/PROD)DEVrisk_yearRisk assessment yearcurrent_yearclaim_duration_yearsYears of claims to look back2plan_nameHealth plan identifier(required)modelCMS model (CMS-HCC/RxHCC/ESRD)CMS-HCCgap_methodsComma-separated method IDs to run1,2,10,4source_load_monthProcessing month (MM)(required)source_load_yearProcessing year (YYYY)current_yearNotebook Initialization Logic:
+# Schema derivation
+v_plan_name = get_plan_name(plan_name)
+schema = v_plan_name + "transformation"
+schema_curation = v_plan_name + "curation"
+schema_ingestion = v_plan_name + "ingestion"
+gap_schema_curation = v_plan_name + "gap_curation"
+
+# Method list parsing
+method_list = [int(m.strip()) for m in gap_methods.split(",")]
+
+# Source load month/year
+source_load_year_month = source_load_year + "_" + source_load_month
+Main Orchestration Call:
+call_gp_suspecting_main(
+    spark,
+    env,
+    catalog,          # pop_dev / pop_qa / pop_stg / pop_prod
+    schema,           # {plan}_transformation
+    schema_curation,  # {plan}_curation
+    schema_ingestion, # {plan}_ingestion
+    gap_schema_curation,  # {plan}_gap_curation
+    ma_reference,     # ma_reference
+    method_list,      # [1, 2, 10, 4]
+    risk_year,        # YYYY
+    no_of_year,       # 2
+    plan_name,        # health plan identifier
+    current_user,     # Databricks user running the notebook
+    source_load_year_month,  # YYYY_MM
+    logger,
+    save_to_table     # True/False (for testing)
+)
+11.3 Full Execution Sequence
+call_gp_suspecting_main()
+    ?
+    ??? get_method_metadata_df()          ? Load active methods from ref_method_metadata
+    ?
+    ??? For each METHOD_ID in method_list:
+    ?     ??? load_method_exclusions_10()  ? (Method 10 only)
+    ?     ??? get_method_wise_inclusion()  ? Get gap candidates for this method
+    ?
+    ??? UNION all method results
+    ?
+    ??? save_to_draft_gaps_table()         ? Write to {plan}_gap_curation.draft_gaps
+    ?      PARTITIONED BY (SOURCE_LOAD_MONTH, HOME_PLAN_ID_CD, METHOD_ID)
+    ?
+    ??? add_suppression1_on_draft_gap()    ? Mark documentation suppressions
+    ?
+    ??? add_suppression2_on_draft_gap()    ? Mark plan exclusion suppressions
+    ?
+    ??? two_level_suppression_logic_final() ? Combine suppression flags
+    ?
+    ??? save_to_draft_gaps_with_details_table() ? Enriched draft with member info
+    ?
+    ??? save_to_suspected_gaps_with_frequency()  ? Final output with scoring
+
+12. Performance Characteristics and Optimization
+12.1 Scale
+The gap suspecting engine operates on datasets of:
+MetricValueTotal records (draft_gaps across methods)400–500+ millionMembers per large plan500,000–2,000,000HCC codes per member3–15 averageMethods per run4 (1, 2, 4, 10)Processing time (POP-ADVYZER-LARGE)30–90 minutes per plan12.2 Partition Strategy
+All three gap output tables use a 3-column partition:
+PARTITIONED BY (SOURCE_LOAD_MONTH, HOME_PLAN_ID_CD, METHOD_ID)
+Rationale:
+* SOURCE_LOAD_MONTH: Enables efficient monthly reprocessing (partition overwrite)
+* HOME_PLAN_ID_CD: Isolates plan data for targeted queries and rewrites
+* METHOD_ID: Allows independent method reprocessing without touching other methods
+Real-world partition size variation:
+PartitionApprox Record CountSmall plan + Method 4~145 recordsLarge plan + Method 10~26.7 million recordsThis extreme variation (145 to 26.7M) is inherent to the data distribution and reflects:
+* Method 4's precision (permanent conditions only = low volume)
+* Method 10's comprehensiveness (all chronic conditions with exclusion logic = high volume)
+* Plan size differences (small vs. large plan membership)
+12.3 Auto-Optimization Settings
+All gap tables include:
+TBLPROPERTIES (
+    'delta.autoOptimize.optimizeWrite' = 'true',   -- coalesce small files on write
+    'delta.autoOptimize.autoCompact'   = 'true',   -- background compaction
+    'delta.enableIcebergCompatV2'      = 'true',   -- Iceberg compatibility
+    'delta.columnMapping.mode'         = 'name'    -- schema evolution
+)
+12.4 Performance Optimization Techniques
+Method 10 get_scenario1_gap_claims_optimized:
+1. Push SOURCE_LOAD_MONTH filter before all joins (partition pruning)
+2. Broadcast-join exclusion tables (ref_method_metadata_codegroups is <100MB)
+3. Use anti-join instead of NOT IN subquery
+4. Cache persistence DataFrame (reused in Scenario 1 and Scenario 2)
+5. Avoid unnecessary column selection — select only required columns early
+save_to_draft_gaps_table optimization:
+1. Repartition before write: df.repartition(200, "HOME_PLAN_ID_CD", "METHOD_ID")
+2. Use partition overwrite: spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+3. Write mode: "overwrite" scoped to current partition
+4. Enable optimizeWrite at session level for current run
+Suppression logic optimization:
+1. Cache draft_gaps DataFrame (read twice for suppression 1 and 2)
+2. Suppression 1: use broadcast join with risk_member_hcc current partition
+3. Suppression 2: minimize ref_method_metadata_codegroups reloads (cache once)
+4. Two-level suppression combined in single pass (avoid reading draft_gaps twice)
+12.5 Cluster Sizing Recommendation
+Use CaseClusterWorkersRecommendationSmall plan (<200K members)POP-ADVYZER-STANDARD2–4SufficientLarge plan (>500K members)POP-ADVYZER-LARGE4–8RequiredAll methods full runPOP-ADVYZER-LARGE6–10RecommendedMethod 10 standalonePOP-ADVYZER-LARGE4–6Minimum
+13. Key Functions Reference
+13.1 Entry Point (gap_suspecting_main.py)
+FunctionDescriptioncall_gp_suspecting_main(...)Top-level orchestrator; calls all helper functions in sequence13.2 Core Processing (gap_suspecting_helper.py, 3,030 lines)
+FunctionLineDescriptionget_method_metadata_df~50Load method metadata from ref_method_metadataget_method_wise_inclusion~150Run gap identification for specified methodsload_method_exclusions_10~400Load all exclusion data for Method 10get_scenario1_gap_claims_optimized~550Method 10 Scenario 1 with 180-day lookbacksave_to_draft_gaps_table~2071Write gap candidates to draft_gaps with 3-column partitionadd_suppression1_on_draft_gap~2200Apply documentation-based suppression flagsadd_suppression2_on_draft_gap~2400Apply plan-exclusion suppression flagstwo_level_suppression_logic_final~2600Combine both suppressions into IS_SUPPRESSEDsave_to_draft_gaps_with_details_table~2700Write enriched gaps with member/provider detailssave_to_suspected_gaps_with_frequency~2800Compute frequency/confidence; write suspected_gaps13.3 Supporting Utilities
+FunctionFileDescriptionread_tabledatabricks_util.pyRead Delta table with filter/column selectionwrite_tabledatabricks_util.pyWrite DataFrame to Delta with modeupsert_delta_tabledatabricks_util.pyMERGE upsert for Delta tablesget_plan_namedatabricks_util.pyResolve plan schema prefixget_config_yamlconfig_util.pyLoad YAML configuration fileget_loggerlogger_util.pyInitialize structured logger
+14. Configuration Reference
+14.1 Gap Suspecting Parameters (gap_suspecting_main.py widgets)
+ParameterTypeValuesDescriptionenvStringDEV/QA/STG/PRODTarget environmentrisk_yearStringYYYYRisk assessment yearclaim_duration_yearsInteger1–5Prior-years lookbackplan_nameStringplan identifierHealth plan namemodelStringCMS-HCC/RxHCC/ESRDCMS model filtergap_methodsString"1,2,10,4"Comma-separated method IDssource_load_monthString01–12Processing monthsource_load_yearStringYYYYProcessing year14.2 Method Control
+To run a subset of methods (e.g., only Method 10 for re-processing):
+Airflow trigger conf:
+{
+  "application": "gp_curation",
+  "plan_name": "planA",
+  "gap_methods": "10",
+  "source_load_month": "06",
+  "source_load_year": "2025",
+  "risk_year": "2025"
+}
+To run all methods (standard monthly run):
+"gap_methods": "1,2,10,4"
+14.3 Method ID Reference
+Method IDMethod NameVolumeAccuracyClinical Use1Diagnosis-Based GapHighHighPrimary gap identification2Procedure-Based GapModerateModerateTreatment-implied conditions4Persistent CarryforwardLowVery HighPermanent/chronic conditions10Multi-Step ExclusionVery HighHighComplex scenario analysis14.4 Suppression Code Reference
+FlagValueMeaningIS_SUPPRESSED_1YCondition documented in current year ? not a real gapIS_SUPPRESSED_1NCondition NOT documented in current year ? potential gapIS_SUPPRESSED_2YPlan or method exclusion applies ? remove from suspectsIS_SUPPRESSED_2NNo plan/method exclusion ? retainIS_SUPPRESSEDYGap suppressed (either or both suppression flags = Y)IS_SUPPRESSEDNActive gap suspect ? included in suspected_gaps14.5 values.yaml Relevant Settings for Gap Suspecting
+SettingValueDescriptioncatalogpop_{env}Databricks catalogconfig_schemama_referenceReference data schematarget_score_table_modeoverwriteWrite mode for gap tablesnotebook_time_out3600Max execution per task (seconds)14.6 DDL Table Properties Reference
+All three gap output tables share the following DDL pattern:
+CREATE TABLE IF NOT EXISTS {catalog}.{gap_schema_curation}.draft_gaps (
+    -- columns --
+)
+USING DELTA
+TBLPROPERTIES (
+    'delta.enableIcebergCompatV2'        = 'true',
+    'delta.universalFormat.enabledFormats' = 'iceberg',
+    'delta.columnMapping.mode'           = 'name',
+    'delta.minReaderVersion'             = '2',
+    'delta.minWriterVersion'             = '5',
+    'delta.autoOptimize.optimizeWrite'   = 'true',
+    'delta.autoOptimize.autoCompact'     = 'true'
+)
+PARTITIONED BY (SOURCE_LOAD_MONTH, HOME_PLAN_ID_CD, METHOD_ID);
+The same properties apply to draft_gaps_with_details and suspected_gaps.
+14.7 Input Data Prerequisites
+The following must be completed before gap suspecting can run:
+PrerequisiteSourceStatus Checkrisk_member_hcc populatedcms_hcc_risk_score_calccurrent SOURCE_LOAD_MONTHmember_persistence_hcc populatecms_persistence_hcccurrent RISK_YEARrisk_member populatedma_model_input_datacurrent SOURCE_LOAD_MONTHrisk_member_diag populatedma_model_input_datacurrent SOURCE_LOAD_MONTHref_method_metadata loadedload_reference_data_runIS_ACTIVE = 'Y'ref_method_metadata_codegroups loadedload_reference_data_runfor METHOD_IDs in method_list
+End of Gap Suspecting Engine Technical Documentation
+
